@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Dozz Vision</title>
+  <script src="/js/feather.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="script.js" defer></script>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="favicon.ico">
+  <!-- Icons from Font Awesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.1.1/css/all.min.css">
+</head>
+<body>
+
+  <!-- Sidebar Menu -->
+  <nav id="sidebar">
+    <div class="sidebar-header">
+      <img id="logo" src="./img/logo-black.png"/>
+      <h3>Dozz Vision</h3>
+    </div>
+    <ul class="list-unstyled components">
+      <li>
+        <a href="#" id="mosaic-link">
+          <i data-feather="grid"></i>
+          <span>Mosaico</span>
+        </a>
+      </li>
+      <li>
+        <a href="#" id="settings-link">
+          <i data-feather="settings"></i>
+          <span>Configurações</span>
+        </a>
+      </li>
+      <li>
+        <a href="#" id="cadastros-link">
+          <i data-feather="users"></i>
+          <span>Cadastros</span>
+        </a>
+      </li>
+      <li>
+        <a href="#" id="dashboard-plate-link">
+          <i data-feather="monitor"></i>
+          <span>Dashboard Plate</span>
+        </a>
+      </li>
+      <li>
+        <a href="#" id="dashboard-ia-link">
+          <i data-feather="monitor"></i>
+          <span>Dashboard IA</span>
+        </a>
+      </li>
+      <li>
+        <a href="#" id="dashboard-speed-link">
+          <i data-feather="monitor"></i>
+          <span>Dashboard Speed</span>
+        </a>
+      </li>
+      <li>
+        <a href="#" id="eventos-link">
+          <i data-feather="layers"></i>
+          <span>Eventos</span>
+        </a>
+      </li>
+    </ul>
+  </nav>
+
+  <!-- Page Content -->
+  <div id="content">
+    <nav class="navbar">
+      <div class="container-fluid">
+        <button type="button" id="sidebarCollapse" class="btn btn-primary">
+          <i class="fas fa-bars"></i>
+        </button>
+        <h2 id="page-title">Bem-vindo</h2>
+      </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div id="main-content">
+      <!-- O conteúdo será carregado dinamicamente pelo script.js -->
+    </div>
+  </div>
+
+  <!-- Modais Globais -->
+  <!-- Modal de Ação -->
+  <div id="actionModal" class="modal">
+    <div class="modal-content">
+      <span id="closeActionModal" class="close">&times;</span>
+      <h2 id="modalTitle"></h2>
+      <div id="modalBody"></div>
+      <div id="areaTypeContainer">
+        <label for="areaTypeSelect">Tipo de Área:</label>
+        <select id="areaTypeSelect">
+          <option value="line">Linha</option>
+          <option value="area">Área</option>
+        </select>
+      </div>
+      <div id="lineButtons" style="display: none;">
+        <button id="createLineButton">Criar Linha</button>
+        <button id="createDirectionButton">Criar Direção</button>
+      </div>
+      <div id="areaButtons" style="display: none;">
+        <button id="createAreaButton">Criar Área</button>
+      </div>
+      <button id="saveActionButton">Salvar Ação</button>
+    </div>
+  </div>
+
+  <!-- Modal de Nome da Linha -->
+  <div id="lineNameModal" class="modal">
+    <div class="modal-content modalContainer">
+      <span id="closeLineNameModal" class="close">&times;</span>
+      <h2 class="secondary-modal-title">Nome da Linha</h2>
+      <input type="text" id="lineNameInput" placeholder="Nome da Linha">
+      <button id="lineNameConfirmButton">Confirmar</button>
+    </div>
+  </div>
+
+  <!-- Modal de Desenho da Linha -->
+  <div id="drawLineModal" class="modal">
+    <div class="modal-content">
+      <span id="closeDrawLineModal" class="close">&times;</span>
+      <h2 class="secondary-modal-title">Desenhar Linha</h2>
+      <button id="startDrawLineButton">Iniciar Desenho</button>
+    </div>
+  </div>
+
+  <!-- Modal de Confirmação da Linha -->
+  <div id="confirmLineModal" class="modal">
+    <div class="modal-content">
+      <span id="closeConfirmLineModal" class="close">&times;</span>
+      <h2>Confirmar Linha</h2>
+      <button id="saveLineButton">Salvar</button>
+      <button id="cancelLineButton">Cancelar</button>
+    </div>
+  </div>
+
+  <!-- Modal de Direção -->
+  <div id="directionModal" class="modal">
+    <div class="modal-content modalContainer">
+      <span id="closeDirectionModal" class="close">&times;</span>
+      <h2 class="secondary-modal-title">Nome da Direção</h2>
+      <input type="text" id="directionNameInput" placeholder="Nome da Direção">
+      <label for="lineSelect">Selecione uma Linha:</label>
+      <select id="lineSelect"></select>
+      <button id="directionNameConfirmButton">Confirmar</button>
+    </div>
+  </div>
+
+  <!-- Modal de Desenho da Direção -->
+  <div id="drawDirectionModal" class="modal">
+    <div class="modal-content">
+      <span id="closeDrawDirectionModal" class="close">&times;</span>
+      <h2>Desenhar Direção</h2>
+      <button id="startDrawDirectionButton">Iniciar Desenho</button>
+    </div>
+  </div>
+
+  <!-- Modal de Confirmação da Direção -->
+  <div id="confirmDirectionModal" class="modal">
+    <div class="modal-content">
+      <span id="closeConfirmDirectionModal" class="close">&times;</span>
+      <h2 class="modalTitle">Confirmar Direção</h2>
+      <button id="saveDirectionButton">Salvar</button>
+      <button id="cancelDirectionButton">Cancelar</button>
+    </div>
+  </div>
+
+  <!-- Modal de Nome da Área -->
+  <div id="areaNameModal" class="modal">
+    <div class="modal-content">
+      <span id="closeAreaNameModal" class="close">&times;</span>
+      <h2>Nome da Área</h2>
+      <input type="text" id="areaNameInput" placeholder="Nome da Área">
+      <button id="areaNameConfirmButton">Confirmar</button>
+    </div>
+  </div>
+
+  <!-- Modal de Desenho da Área -->
+  <div id="drawAreaModal" class="modal">
+    <div class="modal-content">
+      <span id="closeDrawAreaModal" class="close">&times;</span>
+      <h2 class="modalTitle">Desenhar Área</h2>
+      <button id="startDrawAreaButton">Iniciar Desenho</button>
+    </div>
+  </div>
+
+  <!-- Modal de Confirmação da Área -->
+  <div id="confirmAreaModal" class="modal">
+    <div class="modal-content">
+      <span id="closeConfirmAreaModal" class="close">&times;</span>
+      <h2 class="modalTitle">Confirmar Área</h2>
+      <button id="saveAreaButton">Salvar</button>
+      <button id="cancelAreaButton">Cancelar</button>
+    </div>
+  </div>
+
+  <div id="addChannelModal" class="modal">
+    <div class="modal-content">
+      <span id="closeAddChannelModal" class="close">&times;</span>
+      <h2 class="modalTitle">Adicionar Canal</h2>
+      <form id="addChannelForm">
+        <label for="addChannelType">Tipo de Canal:</label>
+        <select id="addChannelType" name="channel_type" required>
+          <option value="ia">IA</option>
+          <option value="plate">Placa</option>
+          <option value="speed">Radar</option>
+        </select>
+        <label for="addChannelName">Nome do Canal:</label>
+        <input type="text" id="addChannelName" name="name" required><br>
+        
+        <label for="addChannelIp">IP da Câmera:</label>
+        <input type="text" id="addChannelIp" name="cameraIp" required><br>
+        
+        <label for="addChannelUsername">Username:</label>
+        <input type="text" id="addChannelUsername" name="username" required><br>
+        
+        <label for="addChannelPassword">Password:</label>
+        <input type="password" id="addChannelPassword" name="password" required><br>
+        
+        <label for="addChannelFps">FPS:</label>
+        <input type="number" id="addChannelFps" name="fps" value="5" required><br>
+        
+        <label for="addChannelDvr">Canal DVR:</label>
+        <input type="number" id="addChannelDvr" name="dvrChannel" value="1" required><br>
+        
+        <label for="addChannelImgSize">Tamanho da Imagem:</label>
+        <select id="addChannelImgSize" name="imgSize" required>
+          <option value="480">Pequena</option>
+          <option value="640" selected>Média</option>
+          <option value="800">Grande</option>
+          <option value="1088">Extra</option>
+        </select><br>
+
+
+        <label for="addChannelArea">Área vinculada:</label>
+        <select id="addChannelArea" name="areaId">
+          <option value="">Selecione uma área</option>
+        </select><br>
+
+
+        <!-- Novo campo para Device (CPU/GPU) -->
+        <label for="addChannelDevice">Device:</label>
+        <select id="addChannelDevice" name="device" required>
+          <option value="cpu">CPU</option>
+          <option value="gpu">GPU</option>
+        </select><br>
+
+        <!-- grupo do radar -->
+        <div id="addRadarIdGroup" style="display:none;">
+          <label for="addChannelRadarId">ID do Radar</label>
+          <input type="text" id="addChannelRadarId" name="radarId" />
+
+          <label for="addChannelMaxSpeed">Velocidade Máxima (km/h):</label>
+          <input
+            type="number"
+            id="addChannelMaxSpeed"
+            name="maxSpeed"
+            min="0"
+            step="1"
+            placeholder="Ex: 40"
+          />
+
+          <label for="editChannelTolerance">Tolerância (km/h):</label>
+          <input
+            type="number"
+            id="addChannelTolerance"
+            name="tolerance"
+            min="0"
+            step="1"
+            placeholder="Ex: 5"
+          />
+
+          <label for="addChannelLocation">Coordenadas:</label>
+          <input type="text" id="addChannelLocation" name="location" required><br>
+          
+          <label for="addChannelAdd">Endereço:</label>
+          <input type="text" id="addChannelAdd" name="add" required><br>
+        </div>
+
+        <!-- grupo do Mg3000 -->
+        <div id="addMg300Group">
+          <label for="addChannelEquipAdd">Controladora IP:</label>
+          <input type="text" id="addChannelEquipAdd" name="equipAdd" placeholder="Ex: 192.168.0.100"><br>
+    
+          <label for="addChannelReceptorAdd">Receptora:</label>
+          <input type="text" id="addChannelReceptorAdd" name="receptorAdd" placeholder="Ex: 01"><br>
+    
+          <label for="addChannelPort">Porta:</label>
+          <input type="number" id="addChannelPort" name="port" placeholder="Ex: 9000"><br>
+        </div>
+
+        <button type="submit">Salvar</button>
+        <button type="button" id="cancelAddChannel">Cancelar</button>
+      </form>
+    </div>
+  </div>
+  
+  <!-- Modal para Editar Canal -->
+  <div id="editChannelModal" class="modal">
+    <div class="modal-content">
+      <span id="closeEditChannelModal" class="close">&times;</span>
+      <h2 class="modalTitle">Editar Canal</h2>
+      <form id="editChannelForm">
+        <input type="hidden" id="editChannelId" name="_id">
+
+        <label for="editChannelType">Tipo de Canal:</label>
+        <select id="editChannelType" name="channel_type" required>
+          <option value="ia">IA</option>
+          <option value="plate">Placa</option>
+          <option value="speed">Radar</option>
+        </select><br>
+
+        <label for="editChannelName">Nome do Canal:</label>
+        <input type="text" id="editChannelName" name="name" required><br>
+        
+        <label for="editChannelIp">IP da Câmera:</label>
+        <input type="text" id="editChannelIp" name="cameraIp" required><br>
+        
+        <label for="editChannelUsername">Username:</label>
+        <input type="text" id="editChannelUsername" name="username" required><br>
+        
+        <label for="editChannelPassword">Password:</label>
+        <input type="password" id="editChannelPassword" name="password" required><br>
+        
+        <label for="editChannelFps">FPS:</label>
+        <input type="number" id="editChannelFps" name="fps" required><br>
+        
+        <label for="editChannelDvr">Canal DVR:</label>
+        <input type="number" id="editChannelDvr" name="dvrChannel" required><br>
+        
+        <label for="editChannelImgSize">Tamanho da Imagem:</label>
+        <select id="editChannelImgSize" name="imgSize" required>
+          <option value="480">Pequena</option>
+          <option value="640" selected>Média</option>
+          <option value="800">Grande</option>
+          <option value="1088">Extra</option>
+        </select><br>
+
+        <!-- Novo campo para Device (CPU/GPU) -->
+        <label for="editChannelDevice">Device:</label>
+        <select id="editChannelDevice" name="device" required>
+          <option value="cpu">CPU</option>
+          <option value="gpu">GPU</option>
+        </select><br>
+        
+
+        <label for="editChannelArea">Área vinculada:</label>
+        <select id="editChannelArea" name="areaId">
+          <option value="">Selecione uma área</option>
+        </select><br>
+
+
+        <div id="editRadarIdGroup" style="display:none;">
+          <label for="editChannelRadarId">ID do Radar</label>
+          <input type="text" id="editChannelRadarId" name="radarId" />
+
+          <label for="editChannelMaxSpeed">Velocidade Máxima (km/h):</label>
+          <input
+            type="number"
+            id="editChannelMaxSpeed"
+            name="maxSpeed"
+            min="0"
+            step="1"
+            placeholder="Ex: 40"
+          />
+
+          <label for="editChannelTolerance">Tolerância (km/h):</label>
+          <input
+            type="number"
+            id="editChannelTolerance"
+            name="tolerance"
+            min="0"
+            step="1"
+            placeholder="Ex: 5"
+          />
+
+          <label for="editChannelLocation">Coordenadas:</label>
+          <input type="text" id="editChannelLocation" name="location" required><br>
+          
+          <label for="editChannelAdd">Endereço:</label>
+          <input type="text" id="editChannelAdd" name="add" required><br>
+        </div>
+
+        <div id="editMg300Group">
+          <label for="editChannelEquipAdd">Controladora IP:</label>
+          <input type="text" id="editChannelEquipAdd" name="equipAdd"><br>
+    
+          <label for="editChannelReceptorAdd">Receptora:</label>
+          <input type="text" id="editChannelReceptorAdd" name="receptorAdd"><br>
+    
+          <label for="editChannelPort">Porta:</label>
+          <input type="number" id="editChannelPort" name="port"><br>
+        </div>
+        
+        <button type="submit">Salvar</button>
+        <button type="button" id="cancelEditChannelModalButton">Cancelar</button>
+      </form>
+    </div>
+  </div>
+  
+  <!-- Modal para Visualizar Vídeo -->
+  <div id="videoModal" class="modal">
+    <div class="modal-content">
+      <span id="closeVideoModal" class="close">&times;</span>
+      <h2 class="modalTitle">Visualização de Vídeo</h2>
+      <div id="video-container">
+        <img id="videoFrameImage" src="" alt="Vídeo do Canal" style="width: 100%; height: auto;">
+      </div>
+    </div>
+  </div>
+
+
+
+
+
+
+
+
+
+
+  <!-- MODAL PRINCIPAL DO RADAR -->
+  <div id="radarConfigModal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <span id="closeRadarConfigModal" class="close">&times;</span>
+      <h2 class="modalTitle">
+        Configurações do Radar
+        <span id="radarChannelName" style="font-weight:normal;font-size:.9rem;"></span>
+      </h2>
+
+      <p id="paramsStatus" class="muted">
+        Aguardando leitura dos parâmetros (X1..X6)...
+      </p>
+
+      <table class="styled-table" style="margin-top:8px;">
+        <tbody>
+          <tr><td>Velocidade mínima (X1)</td><td id="pX1">-</td></tr>
+          <tr><td>Ângulo (X2)</td><td id="pX2">-</td></tr>
+          <tr><td>Sensibilidade (X3)</td><td id="pX3">-</td></tr>
+          <tr><td>Direção (X4)</td><td id="pX4">-</td></tr>
+          <tr><td>FPS / leituras (X5)</td><td id="pX5">-</td></tr>
+          <tr><td>Unidade (X6)</td><td id="pX6">-</td></tr>
+        </tbody>
+      </table>
+
+      <div class="actions-row" style="margin-top:10px; display:flex; flex-wrap:wrap; gap:8px;">
+        <button type="button" id="btnCfg1" class="small">Config 1 (X1,X2,X3)</button>
+        <button type="button" id="btnCfg2" class="small">Config 2 (X4,X5,X6)</button>
+        <button type="button" id="btnCfg3" class="small">Config 3 (HOLD)</button>
+        <button type="button" id="btnCfg4" class="small">Config 4 (dist. inicial)</button>
+        <button type="button" id="btnReadParams" class="small secondary">Ler parâmetros (r)</button>
+      </div>
+
+      <!-- BLOCO CONFIG 1 -->
+      <div id="cfg1Block" class="inner-config" style="margin-top:18px; display:none;">
+        <h3>Config 1 – X1, X2, X3</h3>
+        <p class="muted">
+          Define: velocidade mínima, ângulo e sensibilidade. Enviado como
+          <code>C1 XX YY ZZ</code>.
+        </p>
+
+        <label for="cfg1_x1">Velocidade mínima (X1, km/h – 0 a 255)</label>
+        <input id="cfg1_x1" type="number" min="0" max="255" value="5">
+
+        <label for="cfg1_x2">Ângulo (X2, graus – 0 a 45)</label>
+        <input id="cfg1_x2" type="number" min="0" max="45" value="0">
+
+        <label for="cfg1_x3">Sensibilidade (X3, 1 a 15)</label>
+        <input id="cfg1_x3" type="number" min="1" max="15" value="8">
+
+        <div style="margin-top:10px; text-align:right;">
+          <button type="button" class="secondary" id="cfg1_cancel">Cancelar</button>
+          <button type="button" id="cfg1_send">Enviar Config 1</button>
+        </div>
+      </div>
+
+      <!-- BLOCO CONFIG 2 -->
+      <div id="cfg2Block" class="inner-config" style="margin-top:18px; display:none;">
+        <h3>Config 2 – X4, X5, X6</h3>
+        <p class="muted">
+          Define: direção, taxa de leitura (fps) e unidade. Enviado como
+          <code>C2 XX YY ZZ</code>.
+        </p>
+
+        <label for="cfg2_x4">Direção (X4)</label>
+        <select id="cfg2_x4">
+          <option value="0">0 – Ambos</option>
+          <option value="1">1 – Aproximando</option>
+          <option value="2">2 – Afastando</option>
+        </select>
+
+        <label for="cfg2_x5">FPS / leituras (X5, 0 a 255)</label>
+        <input id="cfg2_x5" type="number" min="0" max="255" value="1">
+
+        <label for="cfg2_x6">Unidade (X6)</label>
+        <select id="cfg2_x6">
+          <option value="0">0 – km/h</option>
+          <option value="1">1 – mph</option>
+          <option value="2">2 – m/s</option>
+        </select>
+
+        <div style="margin-top:10px; text-align:right;">
+          <button type="button" class="secondary" id="cfg2_cancel">Cancelar</button>
+          <button type="button" id="cfg2_send">Enviar Config 2</button>
+        </div>
+      </div>
+
+      <!-- BLOCO CONFIG 3 (HOLD) -->
+      <div id="cfg3Block" class="inner-config" style="margin-top:18px; display:none;">
+        <h3>Config 3 – Tempo de HOLD</h3>
+        <p class="muted">
+          Ajusta o tempo de congelamento (HOLD) no ESP32, em milissegundos
+          (<code>200</code>–<code>15000</code> ms). Enviado como <code>C3 NNNN</code>.
+        </p>
+
+        <label for="cfg3_hold">Tempo de HOLD (ms, 200–15000)</label>
+        <input id="cfg3_hold" type="number" min="200" max="15000" value="4000">
+
+        <div style="margin-top:10px; text-align:right;">
+          <button type="button" class="secondary" id="cfg3_cancel">Cancelar</button>
+          <button type="button" id="cfg3_send">Enviar Config 3</button>
+        </div>
+      </div>
+
+      <!-- BLOCO CONFIG 4 (distância inicial) -->
+      <div id="cfg4Block" class="inner-config" style="margin-top:18px; display:none;">
+        <h3>Config 4 – Distância inicial</h3>
+        <p class="muted">
+          Define a distância aproximada (em metros) em que o radar começa a
+          enxergar o carro. O ESP calcula o atraso para mostrar a velocidade
+          quando o carro estiver a ~20 m do painel. Enviado como <code>C4 NNN</code>.
+        </p>
+
+        <label for="cfg4_dist">Distância inicial (m, 1–200)</label>
+        <input id="cfg4_dist" type="number" min="1" max="200" value="40">
+
+        <div style="margin-top:10px; text-align:right;">
+          <button type="button" class="secondary" id="cfg4_cancel">Cancelar</button>
+          <button type="button" id="cfg4_send">Enviar Config 4</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Modal de snapshot de placa/velocidade -->
+  <div id="snapshotModal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width: 800px;">
+      <span id="closeSnapshotModal" class="close">&times;</span>
+      <h2 id="snapshotTitle" class="modalTitle">Imagem do evento</h2>
+      <div style="text-align:center; max-height:80vh; overflow:auto;">
+        <img id="snapshotImage" src="" alt="Imagem do evento" style="max-width:100%; max-height:75vh;" />
+        <p id="snapshotInfo" style="margin-top:8px; font-size:0.9rem; color:#888;"></p>
+        <p id="snapshotError" style="margin-top:8px; font-size:0.9rem; color:#ff6666; display:none;">
+          Imagem não encontrada em <code id="snapshotPath"></code>.
+        </p>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>

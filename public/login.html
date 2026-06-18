@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dozz Vision — Login</title>
+
+  <link rel="icon" href="/favicon.ico" />
+  <link rel="stylesheet" href="/styles.css" />
+
+  <style>
+    /* ===== Login: visual alinhado com o app (degradê + glass) ===== */
+
+    /* sobrescreve o body do styles.css para o login */
+    body {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(180.21deg, #FFF9F9 -64.58%, rgba(255, 255, 255, 0.45) 115.31%),
+                  linear-gradient(80deg, #FFC368 0%, #D569E1 30%, #4164E1 100%);
+      font-family: Arial, sans-serif;
+    }
+
+    .login-shell {
+      width: min(440px, calc(100vw - 32px));
+      padding: 18px;
+    }
+
+    .login-card {
+      background: rgba(255, 255, 255, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.6);
+      border-radius: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.12);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      overflow: hidden;
+    }
+
+    .login-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 18px 18px 12px;
+      border-bottom: 1px solid rgba(0,0,0,0.06);
+      background: rgba(255, 255, 255, 0.35);
+    }
+
+    .login-logo {
+      width: 52px;
+      height: 52px;
+      object-fit: contain;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.65);
+      padding: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+    }
+
+    .login-title {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.15;
+    }
+
+    .login-title h1 {
+      font-size: 18px;
+      font-weight: 700;
+      margin: 0;
+      color: #111;
+    }
+
+    .login-title p {
+      margin: 3px 0 0;
+      font-size: 13px;
+      color: rgba(0,0,0,0.65);
+    }
+
+    .login-body {
+      padding: 18px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .field label {
+      font-size: 13px;
+      color: rgba(0,0,0,0.75);
+    }
+
+    .field input {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(0,0,0,0.12);
+      background: rgba(255,255,255,0.85);
+      outline: none;
+      transition: box-shadow .2s ease, border-color .2s ease;
+    }
+
+    .field input:focus {
+      border-color: rgba(65, 100, 225, 0.45);
+      box-shadow: 0 0 0 4px rgba(65, 100, 225, 0.12);
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: rgba(0,0,0,0.6);
+    }
+
+    .error {
+      display: none;
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255, 92, 92, 0.12);
+      border: 1px solid rgba(255, 92, 92, 0.28);
+      color: rgba(120, 0, 0, 0.85);
+      font-size: 13px;
+    }
+
+    .login-actions {
+      margin-top: 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .btn-primary {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(65, 100, 225, 0.25);
+      background: rgba(255,255,255,0.85);
+      cursor: pointer;
+      font-weight: 700;
+      transition: transform .08s ease, background-color .2s ease;
+    }
+
+    .btn-primary:hover {
+      background: rgba(255,255,255,0.95);
+    }
+
+    .btn-primary:active {
+      transform: translateY(1px);
+    }
+
+    .footer {
+      padding: 12px 18px 16px;
+      border-top: 1px solid rgba(0,0,0,0.06);
+      display: flex;
+      justify-content: center;
+      font-size: 12px;
+      color: rgba(0,0,0,0.55);
+      background: rgba(255, 255, 255, 0.28);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="login-shell">
+    <div class="login-card">
+      <div class="login-header">
+        <!-- IMPORTANTE: caminho absoluto -->
+        <img class="login-logo" src="/img/logo-black.png" alt="Dozz Vision" />
+        <div class="login-title">
+          <h1>Dozz Vision</h1>
+          <p>Acesso ao painel</p>
+        </div>
+      </div>
+
+      <div class="login-body">
+        <form id="loginForm" autocomplete="on">
+          <div class="field">
+            <label for="username">Usuário</label>
+            <input id="username" name="username" type="text" autocomplete="username" required />
+          </div>
+
+          <div class="field">
+            <label for="password">Senha</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" required />
+          </div>
+
+          <div class="row">
+            <span class="hint" id="endpointHint"></span>
+          </div>
+
+          <div id="loginError" class="error"></div>
+
+          <div class="login-actions">
+            <button class="btn-primary" id="loginBtn" type="submit">
+              Entrar
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div class="footer">
+        © Dozz Technology
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const form = document.getElementById('loginForm');
+      const btn = document.getElementById('loginBtn');
+      const errBox = document.getElementById('loginError');
+      const hint = document.getElementById('endpointHint');
+
+      function showError(msg) {
+        errBox.textContent = msg || 'Falha no login.';
+        errBox.style.display = 'block';
+      }
+
+      function clearError() {
+        errBox.textContent = '';
+        errBox.style.display = 'none';
+      }
+
+      async function tryLogin(endpoint, payload) {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include', // importante se você usa cookie/sessão
+          body: JSON.stringify(payload),
+        });
+
+        // Alguns backends respondem 302/redirect; fetch segue, mas você pode detectar:
+        if (res.redirected) {
+          return { ok: true, redirectUrl: res.url };
+        }
+
+        // tenta JSON; se não for JSON, ignora
+        let data = null;
+        try { data = await res.json(); } catch (_) {}
+
+        if (!res.ok) {
+          const msg = (data && (data.error || data.message)) || `Login inválido (${res.status}).`;
+          return { ok: false, message: msg };
+        }
+
+        return { ok: true, data };
+      }
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        clearError();
+
+        const username = document.getElementById('username').value.trim();
+        const password = document.getElementById('password').value;
+
+        btn.disabled = true;
+        btn.textContent = 'Entrando...';
+
+        const payload = { username, password };
+
+        // Fallback: tenta endpoints comuns sem quebrar seu backend antigo
+        const endpoints = ['/api/login', '/login'];
+        let lastError = null;
+
+        for (const ep of endpoints) {
+          try {
+            hint.textContent = `Conectando em ${ep}...`;
+            const result = await tryLogin(ep, payload);
+
+            if (result.ok) {
+              // Se seu backend retorna { redirect: "/"} ou similar, respeita
+              const redirectFromJson =
+                result.data && (result.data.redirect || result.data.url || result.data.next);
+
+              window.location.href = redirectFromJson || result.redirectUrl || '/';
+              return;
+            } else {
+              lastError = result.message || 'Falha no login.';
+            }
+          } catch (err) {
+            lastError = 'Não foi possível conectar ao servidor de login.';
+          }
+        }
+
+        hint.textContent = '';
+        showError(lastError || 'Falha no login.');
+        btn.disabled = false;
+        btn.textContent = 'Entrar';
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+# Diretórios
+videos/
+plates/
+node_modules/
+venv/
+models/
+
+# Arquivos gerados
+public/captures/
+public/clips/
+
+# Bancos de dados
+*.db
+
+# Scripts de produção / backup
+*_prod.py
+*_prod.js
+*_bkp.js
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+npm-debug.log*

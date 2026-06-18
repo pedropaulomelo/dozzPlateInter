@@ -1,0 +1,9 @@
+opencv-python
+numpy
+ultralytics
+python-socketio
+psutil
+GPUtil
+shapely
+requests
+tensorflow
