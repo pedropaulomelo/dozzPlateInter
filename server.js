@@ -316,6 +316,7 @@ const plateSyncWriteQueues = new Map();
 const gateStatusByChannel = new Map();
 const mg3000RuntimeByKey = new Map();
 const gateCooldownByChannel = new Map();
+const pendingGateOpenByDoorKey = new Map();
 let gateDecisionQueue = Promise.resolve();
 const INTERLOCK_SETTINGS_ID = '__interlock_settings__';
 const DEFAULT_GATE_COMMAND_COOLDOWN_MS = 15000;
@@ -830,6 +831,7 @@ function setChannelGateStatus(channelId, status, patch = {}) {
   gateStatusByChannel.set(normalizedChannelId, next);
   if (next.gateStatus === 'closed' || next.doorStatus === true) {
     clearChannelGateCooldown(normalizedChannelId, 'gate_closed', { emit: false });
+    schedulePendingGateOpenSweep('gate_closed');
   }
   emitGatewayStatusUpdate('gate-status-updated', {
     ...next,
@@ -1202,6 +1204,160 @@ async function startPhysicalDoorCooldownForChannel(channelId, cooldownMs, reason
   return uniqueChannelIds.map((memberChannelId) => (
     startChannelGateCooldown(memberChannelId, cooldownMs, `${reason}:door`)
   )).filter(Boolean);
+}
+
+function clearPendingGateOpen(doorKey, reason = 'cleared') {
+  const normalizedDoorKey = String(doorKey || '').trim();
+  if (!normalizedDoorKey) return null;
+
+  const pending = pendingGateOpenByDoorKey.get(normalizedDoorKey);
+  if (!pending) return null;
+  if (pending.timer) clearTimeout(pending.timer);
+  pendingGateOpenByDoorKey.delete(normalizedDoorKey);
+  console.log(`[gate-pending] removido doorKey=${normalizedDoorKey} reason=${reason}`);
+  return pending;
+}
+
+function schedulePendingGateOpenSweep(reason = 'status_change') {
+  setTimeout(() => {
+    processPendingGateOpens(reason).catch((error) => {
+      console.warn('[gate-pending] falha ao processar pendentes:', error?.message || error);
+    });
+  }, 50);
+}
+
+async function queuePendingGateOpen({ channelId, plate, camera, event, reason, error }) {
+  const normalizedChannelId = normalizeChannelId(channelId);
+  const channel = camera?._id
+    ? camera
+    : await findOneAsync(settingsDb, { _id: normalizedChannelId }).catch(() => null);
+  const doorKey = getChannelPhysicalDoorKey(channel) || `channel:${normalizedChannelId}`;
+  const settings = await getInterlockSettings();
+  const timeoutMs = normalizeDurationMs(settings.gateCommandCooldownMs, DEFAULT_GATE_COMMAND_COOLDOWN_MS);
+  const now = Date.now();
+  const expiresAt = now + timeoutMs;
+
+  clearPendingGateOpen(doorKey, 'replaced');
+  await startPhysicalDoorCooldownForChannel(normalizedChannelId, timeoutMs, `pending_open:${reason || error?.code || 'blocked'}`);
+
+  const pending = {
+    doorKey,
+    channelId: normalizedChannelId,
+    plate,
+    camera,
+    event,
+    reason: reason || error?.code || 'blocked',
+    errorCode: error?.code || null,
+    queuedAt: now,
+    queuedAtIso: new Date(now).toISOString(),
+    expiresAt,
+    expiresAtIso: new Date(expiresAt).toISOString(),
+    running: false,
+    timer: setTimeout(() => {
+      processPendingGateOpen(doorKey, 'timeout', { force: true }).catch((runError) => {
+        console.warn(`[gate-pending] falha no timeout doorKey=${doorKey}:`, runError?.message || runError);
+      });
+    }, timeoutMs),
+  };
+  if (pending.timer?.unref) pending.timer.unref();
+  pendingGateOpenByDoorKey.set(doorKey, pending);
+
+  console.log(`[gate-pending] guardado doorKey=${doorKey} channel=${normalizedChannelId} plate=${plate} reason=${pending.reason} timeoutMs=${timeoutMs}`);
+  io.to(normalizedChannelId).emit('door-command-result', {
+    channelId: normalizedChannelId,
+    plate,
+    accepted: false,
+    queued: true,
+    direction: true,
+    message: 'pending_open',
+    reason: pending.reason,
+    expiresAt: pending.expiresAtIso,
+    timestamp: Date.now(),
+  });
+
+  return pending;
+}
+
+function isPendingOpenError(error) {
+  return ['interlock_blocked', 'gate_cooldown'].includes(String(error?.code || ''));
+}
+
+function dispatchPlateAccessEvent({ channelId, plate, camera, event }) {
+  postPlateEvent({
+    plate,
+    channelId,
+    camera,
+  });
+
+  eventsDb.insert(event, (err, newDoc) => {
+    if (err) {
+      console.error('Erro ao salvar o evento no banco de dados:', err);
+    } else {
+      console.log('Evento salvo no banco de dados:', newDoc);
+    }
+  });
+
+  io.emit('plate-found', event);
+}
+
+async function processPendingGateOpen(doorKey, trigger = 'status_change', options = {}) {
+  const normalizedDoorKey = String(doorKey || '').trim();
+  const pending = pendingGateOpenByDoorKey.get(normalizedDoorKey);
+  if (!pending || pending.running) return false;
+
+  pending.running = true;
+  try {
+    console.log(`[gate-pending] tentando executar doorKey=${normalizedDoorKey} channel=${pending.channelId} plate=${pending.plate} trigger=${trigger}`);
+    await openDoor(pending.channelId, {
+      ignoreCooldown: true,
+      ignoreInterlock: options.force === true,
+      pendingTrigger: trigger,
+    });
+
+    clearPendingGateOpen(normalizedDoorKey, `executed:${trigger}`);
+    dispatchPlateAccessEvent({
+      channelId: pending.channelId,
+      plate: pending.plate,
+      camera: pending.camera,
+      event: pending.event,
+    });
+    io.to(pending.channelId).emit('door-command-result', {
+      channelId: pending.channelId,
+      plate: pending.plate,
+      accepted: true,
+      queued: true,
+      direction: true,
+      trigger,
+      timestamp: Date.now(),
+    });
+    return true;
+  } catch (error) {
+    pending.running = false;
+    if (isPendingOpenError(error) && options.force !== true) {
+      console.log(`[gate-pending] ainda bloqueado doorKey=${normalizedDoorKey} code=${error?.code || '-'} trigger=${trigger}`);
+      return false;
+    }
+
+    clearPendingGateOpen(normalizedDoorKey, `failed:${error?.code || 'error'}`);
+    console.error(`[gate-pending] erro definitivo doorKey=${normalizedDoorKey}:`, error);
+    io.to(pending.channelId).emit('door-command-result', {
+      channelId: pending.channelId,
+      plate: pending.plate,
+      accepted: false,
+      queued: true,
+      direction: true,
+      message: error?.code || error?.message || 'unknown_error',
+      timestamp: Date.now(),
+    });
+    return false;
+  }
+}
+
+async function processPendingGateOpens(trigger = 'status_change') {
+  const doorKeys = Array.from(pendingGateOpenByDoorKey.keys());
+  for (const doorKey of doorKeys) {
+    await processPendingGateOpen(doorKey, trigger, { force: false });
+  }
 }
 
 function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown) {
@@ -3696,37 +3852,6 @@ function handlePlateDetection(channelId, plateData, direction, timestamp, metada
                   processes[channelId].lastPlateDetectionTime = Date.now();
                 }
 
-                openDoor(channelId)
-                  .then(() => {
-                    io.to(channelId).emit('door-command-result', {
-                      channelId,
-                      plate: dbPlate,
-                      accepted: true,
-                      direction: true,
-                      timestamp: Date.now(),
-                    });
-                  })
-                  .catch((error) => {
-                    console.error(`Erro ao abrir porta no canal ${channelId}:`, error);
-                    io.to(channelId).emit('door-command-result', {
-                      channelId,
-                      plate: dbPlate,
-                      accepted: false,
-                      direction: true,
-                      message: error?.code || error?.message || 'unknown_error',
-                      timestamp: Date.now(),
-                    });
-                  });
-                console.log('Open Door')
-
-                // >>> ENVIAR EVENTO HTTP PARA A API CENTRAL <<<
-                // Usa os parâmetros cadastrados no canal (camera) que já pegamos no início da função
-                postPlateEvent({
-                  plate: dbPlate,
-                  channelId,
-                  camera
-                });
-
                 const customerInfo = {
                   plate: dbPlate,
                   name: userName,
@@ -3754,17 +3879,48 @@ function handlePlateDetection(channelId, plateData, direction, timestamp, metada
                   sourceEventType: metadata.eventType || null,
                 };
 
-                // Salvar no eventsDb
-                eventsDb.insert(event, (err, newDoc) => {
-                  if (err) {
-                    console.error('Erro ao salvar o evento no banco de dados:', err);
-                  } else {
-                    console.log('Evento salvo no banco de dados:', newDoc);
-                  }
-                });
+                openDoor(channelId)
+                  .then(() => {
+                    io.to(channelId).emit('door-command-result', {
+                      channelId,
+                      plate: dbPlate,
+                      accepted: true,
+                      direction: true,
+                      timestamp: Date.now(),
+                    });
+                    dispatchPlateAccessEvent({
+                      channelId,
+                      plate: dbPlate,
+                      camera,
+                      event,
+                    });
+                  })
+                  .catch((error) => {
+                    if (isPendingOpenError(error)) {
+                      queuePendingGateOpen({
+                        channelId,
+                        plate: dbPlate,
+                        camera,
+                        event,
+                        reason: error?.code || 'blocked',
+                        error,
+                      }).catch((queueError) => {
+                        console.error(`Erro ao guardar abertura pendente no canal ${channelId}:`, queueError);
+                      });
+                      return;
+                    }
 
-                // Emitir para o frontend o evento plate-found com dados do cliente
-                io.emit('plate-found', event);
+                    console.error(`Erro ao abrir porta no canal ${channelId}:`, error);
+                    io.to(channelId).emit('door-command-result', {
+                      channelId,
+                      plate: dbPlate,
+                      accepted: false,
+                      direction: true,
+                      message: error?.code || error?.message || 'unknown_error',
+                      timestamp: Date.now(),
+                    });
+                  });
+                console.log('Open Door')
                 break;
               }
             }
@@ -4126,12 +4282,12 @@ async function startConfiguredGateCooldown(channelId, reason = 'command_open') {
 }
 
 // Função para abrir porta (adaptar conforme necessidade)
-async function openDoor(channelId) {
+async function openDoor(channelId, options = {}) {
   return enqueueGateDecision(async () => {
     try {
       console.log('Opening Door');
 
-      const cooldown = getActiveChannelGateCooldown(channelId);
+      const cooldown = options.ignoreCooldown === true ? null : getActiveChannelGateCooldown(channelId);
       if (cooldown) {
         const remainingMs = Math.ceil(cooldown.remainingMs);
         const error = new Error(`Canal em cooldown de abertura por mais ${Math.ceil(remainingMs / 1000)}s.`);
@@ -4146,7 +4302,9 @@ async function openDoor(channelId) {
         throw error;
       }
 
-      const interlock = await evaluateChannelInterlock(channelId);
+      const interlock = options.ignoreInterlock === true
+        ? { allowed: true, ignored: true }
+        : await evaluateChannelInterlock(channelId);
       if (!interlock.allowed) {
         const error = new Error(`Intertravamento ativo: porta ${interlock.blockingDoorKey || interlock.blockingChannelId} está ${interlock.blockingGateStatus}.`);
         error.code = 'interlock_blocked';
