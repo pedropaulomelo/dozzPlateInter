@@ -448,12 +448,173 @@ function normalizeGateStatusFromDoorStatus(doorStatus) {
   return 'unknown';
 }
 
+function parseMg300DoorStatus(buffer) {
+  const bytes = new Uint8Array(buffer);
+  return {
+    door1: (bytes[5] & 0x0F) !== 0x00,
+    door2: (bytes[5] & 0xF0) !== 0x00,
+    door3: (bytes[4] & 0x0F) !== 0x00,
+    door4: (bytes[4] & 0xF0) === 0x40,
+  };
+}
+
+function getChannelMg300ReceptorIndex(channel = {}) {
+  return toIntegerOrNull(channel.receptorAdd);
+}
+
+function getChannelMg300DoorNumber(channel = {}) {
+  return toIntegerOrNull(channel.port);
+}
+
 function buildControllerRuntimeKey({ apiKey, controllerAddress } = {}) {
   const normalizedApiKey = String(apiKey || '').trim();
   if (normalizedApiKey) return `api:${normalizedApiKey}`;
   const normalizedAddress = normalizeControllerAddress(controllerAddress);
   if (normalizedAddress) return `addr:${normalizedAddress}`;
   return 'unknown';
+}
+
+function findOnlineMg3000RuntimeForChannel(channel = {}) {
+  const channelApiKey = String(channel.mg3000ApiKey || channel.apiKey || '').trim();
+  const channelAddress = normalizeControllerAddress(channel.equipAdd || channel.vehicleAdd);
+
+  if (channelApiKey) {
+    const byApiKey = mg3000RuntimeByKey.get(`api:${channelApiKey}`);
+    if (byApiKey?.online === true) return byApiKey;
+  }
+
+  for (const runtime of mg3000RuntimeByKey.values()) {
+    if (runtime?.online !== true) continue;
+    const runtimeApiKey = String(runtime.apiKey || '').trim();
+    const runtimeAddress = normalizeControllerAddress(runtime.controllerAddress);
+    if (channelApiKey && runtimeApiKey && channelApiKey === runtimeApiKey) return runtime;
+    if (channelAddress && runtimeAddress && channelAddress === runtimeAddress) return runtime;
+  }
+
+  return null;
+}
+
+function queryMg300SensorStatusOnce(ip, port, rec) {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+    const command = Buffer.from([0x00, 0x5D, 0x01, rec]);
+    const checksum = calculateChecksum(command);
+    const commandWithChecksum = Buffer.concat([command, Buffer.from([checksum])]);
+    let settled = false;
+
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      socket.removeAllListeners();
+      if (!socket.destroyed) socket.destroy();
+      fn(value);
+    };
+
+    socket.setTimeout(MG300_SOCKET_TIMEOUT_MS);
+    socket.setNoDelay(true);
+
+    socket.once('connect', () => {
+      socket.write(commandWithChecksum, (writeError) => {
+        if (writeError) settle(reject, writeError);
+      });
+    });
+
+    socket.on('data', (data) => {
+      if (Buffer.isBuffer(data) && data[1] === 0x5D) {
+        settle(resolve, {
+          statusCode: 200,
+          receptorIndex: data[3],
+          doorsStatus: parseMg300DoorStatus(data),
+          rawHex: data.toString('hex'),
+        });
+        return;
+      }
+
+      const error = new Error('Resposta inesperada do MG300 na consulta de status.');
+      error.responseHex = Buffer.isBuffer(data) ? data.toString('hex') : null;
+      settle(reject, error);
+    });
+
+    socket.once('timeout', () => {
+      const timeoutError = new Error(`Timeout consultando status do MG300 (${MG300_SOCKET_TIMEOUT_MS} ms).`);
+      timeoutError.code = 'MG300_TIMEOUT';
+      settle(reject, timeoutError);
+    });
+
+    socket.once('error', (error) => {
+      settle(reject, error);
+    });
+
+    socket.connect({ host: ip, port });
+  });
+}
+
+async function queryMg300SensorStatus(ip, port, rec) {
+  const queueKey = `${ip}:${port}`;
+  return enqueueMg300Command(queueKey, async () => {
+    await waitForMg300Gap(queueKey);
+    try {
+      return await queryMg300SensorStatusOnce(ip, port, rec);
+    } finally {
+      mg300LastCommandAt.set(queueKey, Date.now());
+    }
+  });
+}
+
+async function refreshMg300StatusForChannel(channel = {}, reason = 'status_query') {
+  const doorDriver = normalizeDoorDriver(channel.doorDriver);
+  if (doorDriver === 'dozz_vehicle') return null;
+
+  const controllerAddress = normalizeControllerAddress(channel.equipAdd);
+  const receptorIndex = getChannelMg300ReceptorIndex(channel);
+  const doorNumber = getChannelMg300DoorNumber(channel);
+  if (!controllerAddress || receptorIndex === null || doorNumber === null) return null;
+
+  const status = await queryMg300SensorStatus(controllerAddress, MG300_TCP_PORT, receptorIndex);
+  const onlineRuntime = findOnlineMg3000RuntimeForChannel(channel);
+  const matchingChannels = await findAsync(settingsDb, {});
+  const sameControllerChannels = matchingChannels.filter((candidate) => (
+    normalizeControllerAddress(candidate.equipAdd) === controllerAddress
+    && getChannelMg300ReceptorIndex(candidate) === receptorIndex
+  ));
+
+  const updates = [];
+  for (const candidate of sameControllerChannels) {
+    const candidateDoor = getChannelMg300DoorNumber(candidate);
+    const doorStatus = status?.doorsStatus?.[`door${candidateDoor}`];
+    if (doorStatus !== true && doorStatus !== false) continue;
+
+    const update = setChannelGateStatus(candidate._id, normalizeGateStatusFromDoorStatus(doorStatus), {
+      doorStatus,
+      controllerOnline: true,
+      controllerKey: onlineRuntime?.key || buildControllerRuntimeKey({
+        apiKey: candidate.mg3000ApiKey || candidate.apiKey || onlineRuntime?.apiKey,
+        controllerAddress,
+      }),
+      controllerAddress,
+      apiKey: candidate.mg3000ApiKey || candidate.apiKey || onlineRuntime?.apiKey || null,
+      receptorAdd: receptorIndex,
+      door: candidateDoor,
+      lastEventKey: reason,
+      lastRawHex: status?.rawHex || null,
+    });
+    if (update) updates.push(update);
+  }
+
+  if (updates.length > 0) {
+    console.log(`[mg3000-status] status inicial atualizado rec=${receptorIndex} canais=${updates.length}`);
+  }
+
+  return { status, updates };
+}
+
+function refreshMg300StatusForChannelSoon(channel, reason = 'channel_start') {
+  refreshMg300StatusForChannel(channel, reason).catch((error) => {
+    console.warn(
+      `[mg3000-status] falha ao consultar status inicial do canal ${channel?._id || ''}:`,
+      error?.code || error?.message || error
+    );
+  });
 }
 
 function emitGatewayStatusUpdate(eventName, payload) {
@@ -946,6 +1107,8 @@ async function buildGatewayStatusPayload() {
 
   const channelPayload = channels.map((channel) => {
     const runtime = getChannelGateRuntime(channel._id);
+    const controllerRuntime = findOnlineMg3000RuntimeForChannel(channel);
+    const controllerOnline = runtime.controllerOnline === true || controllerRuntime?.online === true;
     const process = processByChannel.get(channel._id) || { channelId: channel._id, status: 'stopped' };
     const item = {
       channelId: channel._id,
@@ -954,14 +1117,14 @@ async function buildGatewayStatusPayload() {
       processStatus: process.status || 'stopped',
       gateStatus: runtime.gateStatus || 'unknown',
       doorStatus: runtime.doorStatus ?? null,
-      controllerOnline: runtime.controllerOnline === true,
-      controllerKey: runtime.controllerKey || null,
-      controllerAddress: runtime.controllerAddress || channel.equipAdd || null,
-      apiKey: runtime.apiKey || channel.mg3000ApiKey || channel.apiKey || null,
+      controllerOnline,
+      controllerKey: runtime.controllerKey || controllerRuntime?.key || null,
+      controllerAddress: runtime.controllerAddress || controllerRuntime?.controllerAddress || channel.equipAdd || null,
+      apiKey: runtime.apiKey || channel.mg3000ApiKey || channel.apiKey || controllerRuntime?.apiKey || null,
       receptorAdd: runtime.receptorAdd ?? channel.receptorAdd ?? null,
       door: runtime.door ?? channel.port ?? null,
-      updatedAt: runtime.updatedAtIso || null,
-      lastEventKey: runtime.lastEventKey || null,
+      updatedAt: runtime.updatedAtIso || controllerRuntime?.updatedAtIso || null,
+      lastEventKey: runtime.lastEventKey || controllerRuntime?.lastEventKey || null,
     };
     channelStates[channel._id] = item;
     channelDoorStatus[channel._id] = item.doorStatus;
@@ -2499,6 +2662,7 @@ function refreshRunningSharedPlateChannel(channelId) {
           processes[channelId].status = 'starting';
           processes[channelId].errorType = null;
           io.emit('process-starting', { channelId });
+          refreshMg300StatusForChannelSoon(channel, 'channel_runtime_refresh');
           console.log(`[plate-batch] Configuração do canal aplicada em runtime: ${channelId}`);
         });
       });
@@ -2649,6 +2813,7 @@ function startPlateRecognition(channel, actions, areas, directions, res) {
     };
 
     io.emit('process-starting', { channelId: channel._id });
+    refreshMg300StatusForChannelSoon(channel, 'channel_start');
     return res.send({ success: true, sharedWorker: true });
   }
 
@@ -2720,6 +2885,7 @@ function startPlateRecognition(channel, actions, areas, directions, res) {
   };
 
   io.emit('process-starting', { channelId: channel._id });
+  refreshMg300StatusForChannelSoon(channel, 'channel_start');
 
   process.stdout.on('data', (data) => {
     const output = data.toString();
