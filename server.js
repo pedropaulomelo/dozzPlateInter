@@ -466,6 +466,32 @@ function getChannelMg300DoorNumber(channel = {}) {
   return toIntegerOrNull(channel.port);
 }
 
+function bufferToPrintableAscii(buffer) {
+  return Buffer.from(buffer)
+    .toString('ascii')
+    .replace(/[^\x20-\x7E]/g, '.')
+    .slice(0, 160);
+}
+
+function describeDoorStatus(doorStatus) {
+  if (doorStatus === true) return 'fechado';
+  if (doorStatus === false) return 'aberto';
+  return 'desconhecido';
+}
+
+function describeMg300Event(event = {}) {
+  return [
+    `type=${event.eventType || '-'}`,
+    `key=${event.eventKey || '-'}`,
+    `rec=${event.receptorAdd ?? '-'}`,
+    `door=${event.doorNumber ?? '-'}`,
+    `status=${describeDoorStatus(event.doorStatus)}`,
+    `rf=${event.rfId || '-'}`,
+    `apiKey=${event.apiKey || '-'}`,
+    `addr=${event.controllerAddress || '-'}`,
+  ].join(' ');
+}
+
 function buildControllerRuntimeKey({ apiKey, controllerAddress } = {}) {
   const normalizedApiKey = String(apiKey || '').trim();
   if (normalizedApiKey) return `api:${normalizedApiKey}`;
@@ -502,6 +528,8 @@ function queryMg300SensorStatusOnce(ip, port, rec) {
     const commandWithChecksum = Buffer.concat([command, Buffer.from([checksum])]);
     let settled = false;
 
+    console.log(`[mg3000-status] tx get-status ${ip}:${port} rec=${rec} hex=${commandWithChecksum.toString('hex')}`);
+
     const settle = (fn, value) => {
       if (settled) return;
       settled = true;
@@ -520,11 +548,14 @@ function queryMg300SensorStatusOnce(ip, port, rec) {
     });
 
     socket.on('data', (data) => {
+      console.log(`[mg3000-status] rx get-status ${ip}:${port} rec=${rec} len=${data.length} hex=${data.toString('hex')}`);
       if (Buffer.isBuffer(data) && data[1] === 0x5D) {
+        const doorsStatus = parseMg300DoorStatus(data);
+        console.log(`[mg3000-status] parsed rec=${data[3]} door1=${describeDoorStatus(doorsStatus.door1)} door2=${describeDoorStatus(doorsStatus.door2)} door3=${describeDoorStatus(doorsStatus.door3)} door4=${describeDoorStatus(doorsStatus.door4)}`);
         settle(resolve, {
           statusCode: 200,
           receptorIndex: data[3],
-          doorsStatus: parseMg300DoorStatus(data),
+          doorsStatus,
           rawHex: data.toString('hex'),
         });
         return;
@@ -570,6 +601,7 @@ async function refreshMg300StatusForChannel(channel = {}, reason = 'status_query
   const doorNumber = getChannelMg300DoorNumber(channel);
   if (!controllerAddress || receptorIndex === null || doorNumber === null) return null;
 
+  console.log(`[mg3000-status] consulta canal=${channel._id || '-'} nome="${channel.name || ''}" ctrl=${controllerAddress}:${MG300_TCP_PORT} rec=${receptorIndex} door=${doorNumber} reason=${reason}`);
   const status = await queryMg300SensorStatus(controllerAddress, MG300_TCP_PORT, receptorIndex);
   const onlineRuntime = findOnlineMg3000RuntimeForChannel(channel);
   const matchingChannels = await findAsync(settingsDb, {});
@@ -598,11 +630,16 @@ async function refreshMg300StatusForChannel(channel = {}, reason = 'status_query
       lastEventKey: reason,
       lastRawHex: status?.rawHex || null,
     });
-    if (update) updates.push(update);
+    if (update) {
+      updates.push(update);
+      console.log(`[mg3000-status] canal atualizado id=${candidate._id} nome="${candidate.name || ''}" rec=${receptorIndex} door=${candidateDoor} status=${describeDoorStatus(doorStatus)} gate=${update.gateStatus}`);
+    }
   }
 
   if (updates.length > 0) {
     console.log(`[mg3000-status] status inicial atualizado rec=${receptorIndex} canais=${updates.length}`);
+  } else {
+    console.warn(`[mg3000-status] consulta sem canal atualizado rec=${receptorIndex} door=${doorNumber} raw=${status?.rawHex || '-'}`);
   }
 
   return { status, updates };
@@ -925,7 +962,10 @@ function parseMg3000Frame(rawData) {
 }
 
 async function forwardMg3000EventToApiRedis(eventPayload) {
-  if (!API_MG3000_EVENT_ENDPOINT) return;
+  if (!API_MG3000_EVENT_ENDPOINT) {
+    console.warn(`[mg3000-gateway] forward desabilitado sem MG3000_EVENT_URL event=${describeMg300Event(eventPayload)}`);
+    return;
+  }
 
   try {
     const headers = { 'Content-Type': 'application/json' };
@@ -933,6 +973,7 @@ async function forwardMg3000EventToApiRedis(eventPayload) {
       headers['x-internal-token'] = MG300_GATEWAY_EVENT_FORWARD_TOKEN;
     }
 
+    console.log(`[mg3000-gateway] forward -> ${API_MG3000_EVENT_ENDPOINT} ${describeMg300Event(eventPayload)}`);
     const resp = await fetch(API_MG3000_EVENT_ENDPOINT, {
       method: 'POST',
       headers,
@@ -941,6 +982,9 @@ async function forwardMg3000EventToApiRedis(eventPayload) {
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '');
       console.error('[mg3000-gateway] forward falhou:', resp.status, txt);
+    } else {
+      const txt = await resp.text().catch(() => '');
+      console.log(`[mg3000-gateway] forward ok status=${resp.status} body=${txt.slice(0, 240)}`);
     }
   } catch (error) {
     console.error('[mg3000-gateway] erro ao encaminhar evento:', error?.message || error);
@@ -948,6 +992,7 @@ async function forwardMg3000EventToApiRedis(eventPayload) {
 }
 
 async function applyMg3000EventToLocalState(eventPayload) {
+  console.log(`[mg3000-gateway] evento local recebido ${describeMg300Event(eventPayload)} raw=${eventPayload.rawHex || '-'}`);
   const runtimeKey = buildControllerRuntimeKey(eventPayload);
   setMg3000RuntimeStatus(runtimeKey, {
     online: true,
@@ -959,11 +1004,13 @@ async function applyMg3000EventToLocalState(eventPayload) {
   });
 
   if (eventPayload.doorStatus === null || eventPayload.doorStatus === undefined) {
+    console.log(`[mg3000-gateway] evento sem status de porta, nao altera canal ${describeMg300Event(eventPayload)}`);
     emitGatewayStatusUpdate('mg3000-event', eventPayload);
     return [];
   }
 
   const channels = await findChannelsForMg3000Event(eventPayload);
+  console.log(`[mg3000-gateway] canais casados=${channels.length} ${channels.map((channel) => `${channel._id}:${channel.name || ''}`).join(', ') || '-'}`);
   const updates = channels.map((channel) => setChannelGateStatus(channel._id, eventPayload.gateStatus, {
     doorStatus: eventPayload.doorStatus,
     controllerOnline: true,
@@ -975,6 +1022,12 @@ async function applyMg3000EventToLocalState(eventPayload) {
     lastEventKey: eventPayload.eventKey,
     lastRawHex: eventPayload.rawHex,
   })).filter(Boolean);
+  updates.forEach((update) => {
+    console.log(`[mg3000-gateway] canal atualizado id=${update.channelId} rec=${update.receptorAdd} door=${update.door} status=${describeDoorStatus(update.doorStatus)} gate=${update.gateStatus} event=${update.lastEventKey}`);
+  });
+  if (updates.length === 0) {
+    console.warn(`[mg3000-gateway] nenhum canal atualizado para ${describeMg300Event(eventPayload)}`);
+  }
 
   const localEvent = {
     eventType: 'mg3000_gateway',
@@ -1000,6 +1053,7 @@ async function applyMg3000EventToLocalState(eventPayload) {
 }
 
 async function handleMg3000GatewayData(socketState, rawData) {
+  console.log(`[mg3000-gateway] rx from=${socketState.controllerAddress || '-'} len=${rawData.length} ascii="${bufferToPrintableAscii(rawData)}" hex=${rawData.toString('hex')}`);
   const ascii = rawData.toString('ascii').replace(/\0.*$/g, '').trim();
   if (ascii.startsWith('@') && ascii.includes('@')) {
     const [, mac, apiKey] = ascii.split('@');
@@ -1007,6 +1061,7 @@ async function handleMg3000GatewayData(socketState, rawData) {
     socketState.mac = String(mac || '').trim();
     socketState.apiKey = String(apiKey || '').trim();
     socketState.runtimeKey = buildControllerRuntimeKey(socketState);
+    console.log(`[mg3000-gateway] identificacao mac=${socketState.mac || '-'} apiKey=${socketState.apiKey || '-'} addr=${socketState.controllerAddress || '-'} runtime=${socketState.runtimeKey}`);
     if (previousRuntimeKey && previousRuntimeKey !== socketState.runtimeKey) {
       removeMg3000RuntimeStatus(previousRuntimeKey, {
         controllerAddress: socketState.controllerAddress || null,
@@ -1027,7 +1082,10 @@ async function handleMg3000GatewayData(socketState, rawData) {
   }
 
   const parsed = parseMg3000Frame(rawData);
-  if (!parsed) return;
+  if (!parsed) {
+    console.warn(`[mg3000-gateway] frame nao parseado from=${socketState.controllerAddress || '-'} ascii="${bufferToPrintableAscii(rawData)}" hex=${rawData.toString('hex')}`);
+    return;
+  }
 
   const eventPayload = {
     ...parsed,
@@ -1035,6 +1093,7 @@ async function handleMg3000GatewayData(socketState, rawData) {
     mac: socketState.mac || null,
     controllerAddress: socketState.controllerAddress || null,
   };
+  console.log(`[mg3000-gateway] parsed ${describeMg300Event(eventPayload)}`);
   await applyMg3000EventToLocalState(eventPayload);
   await forwardMg3000EventToApiRedis(eventPayload);
 }
@@ -1055,6 +1114,7 @@ function startMg3000GatewayServer() {
       offlineMarked: false,
     };
 
+    console.log(`[mg3000-gateway] conectado addr=${controllerAddress || '-'} remotePort=${socket.remotePort || '-'} localPort=${socket.localPort || '-'}`);
     setMg3000RuntimeStatus(socketState.runtimeKey, {
       online: true,
       controllerAddress,
@@ -1068,7 +1128,8 @@ function startMg3000GatewayServer() {
       });
     });
 
-    const markOffline = () => {
+    const markOffline = (reason = 'disconnect') => {
+      console.log(`[mg3000-gateway] desconectado addr=${controllerAddress || '-'} reason=${reason} runtime=${socketState.runtimeKey}`);
       if (socketState.offlineMarked) return;
       socketState.offlineMarked = true;
       setMg3000RuntimeStatus(socketState.runtimeKey, {
@@ -1076,13 +1137,13 @@ function startMg3000GatewayServer() {
         controllerAddress,
         apiKey: socketState.apiKey || null,
         mac: socketState.mac || null,
-        lastEventKey: 'disconnect',
+        lastEventKey: reason,
       });
       markControllerChannelsOffline(socketState.runtimeKey);
     };
-    socket.on('error', markOffline);
-    socket.on('close', markOffline);
-    socket.on('end', markOffline);
+    socket.on('error', (error) => markOffline(`error:${error?.code || error?.message || 'socket'}`));
+    socket.on('close', () => markOffline('close'));
+    socket.on('end', () => markOffline('end'));
   });
 
   server.on('error', (error) => {
@@ -2336,6 +2397,7 @@ app.get('/api/gate-status', async (req, res) => {
 app.post('/api/mg3000/events', async (req, res) => {
   try {
     const body = req.body || {};
+    console.log('[mg3000-events] http recebido body=', JSON.stringify(body).slice(0, 1000));
     const eventKey = String(body.eventKey || '').trim();
     const doorStatus = body.doorStatus === true || body.status === true || body.gateStatus === 'closed'
       ? true
@@ -2352,6 +2414,7 @@ app.post('/api/mg3000/events', async (req, res) => {
       timestamp: body.timestamp || new Date().toISOString(),
       rawHex: body.rawHex || null,
     };
+    console.log(`[mg3000-events] http normalizado ${describeMg300Event(payload)}`);
     await applyMg3000EventToLocalState(payload);
     await forwardMg3000EventToApiRedis(payload);
     res.json({ ok: true, event: payload });
@@ -3584,6 +3647,7 @@ async function openDoor(channelId) {
 
       const queueKey = `${mg3000Address}:${MG300_TCP_PORT}`;
 
+      console.log(`[mg3000-command] open channel=${channelId} nome="${canal.name || ''}" ctrl=${mg3000Address}:${MG300_TCP_PORT} rec=${receptorAddress} door=${doorAddress}`);
       await enqueueMg300Command(queueKey, async () => {
         await waitForMg300Gap(queueKey);
         try {
@@ -3647,13 +3711,14 @@ function isTransientMg300Error(error) {
 function openRfDoorOnce(ip, port, rec, door) {
   return new Promise((resolve, reject) => {
     try {
-      console.log('Enviando comando para:', ip, port, rec, door);
       const command = Buffer.from([0x00, 0x5C, 0x01, rec, door, 0x01, 0x01]);
       const checksum = calculateChecksum(command);
       const commandWithChecksum = Buffer.concat([command, Buffer.from([checksum])]);
       const socket = new net.Socket();
       let settled = false;
       let response = Buffer.alloc(0);
+
+      console.log(`[mg3000-command] tx open ${ip}:${port} rec=${rec} door=${door} hex=${commandWithChecksum.toString('hex')}`);
 
       const settle = (fn, value, gracefulClose = false) => {
         if (settled) return;
@@ -3682,7 +3747,7 @@ function openRfDoorOnce(ip, port, rec, door) {
 
       socket.on('data', (data) => {
         response = Buffer.concat([response, data]);
-        console.log('Resposta recebida:', response);
+        console.log(`[mg3000-command] rx open ${ip}:${port} len=${response.length} hex=${response.toString('hex')}`);
         settle(resolve, response, true);
       });
 
