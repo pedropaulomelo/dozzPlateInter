@@ -110,6 +110,12 @@ function parseStoredBoolean(value, defaultValue = true) {
   return Boolean(defaultValue);
 }
 
+function normalizeDurationMs(value, defaultValue = 15000) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  return Math.max(1000, Math.min(10 * 60 * 1000, Math.round(parsed)));
+}
+
 // opcional: restringe processos internos por IP (loopback)
 function isLoopback(addr = "") {
   return addr === "127.0.0.1" || addr === "::1" || addr.startsWith("::ffff:127.0.0.1");
@@ -309,7 +315,10 @@ const mg300LastCommandAt = new Map();
 const plateSyncWriteQueues = new Map();
 const gateStatusByChannel = new Map();
 const mg3000RuntimeByKey = new Map();
+const gateCooldownByChannel = new Map();
 let gateDecisionQueue = Promise.resolve();
+const INTERLOCK_SETTINGS_ID = '__interlock_settings__';
+const DEFAULT_GATE_COMMAND_COOLDOWN_MS = 15000;
 
 // 1 sessão ativa por canal (janela de correlação)
 const speedSessions = new Map(); // channelId -> { sessionId, radarId, speed, speedTimestampMs, deadlineMs, timer, cleanupTimer }
@@ -490,7 +499,7 @@ function describeDoorStatus(doorStatus) {
 }
 
 function describeMg300Event(event = {}) {
-  return [
+  const parts = [
     `type=${event.eventType || '-'}`,
     `key=${event.eventKey || '-'}`,
     `rec=${event.receptorAdd ?? '-'}`,
@@ -499,7 +508,25 @@ function describeMg300Event(event = {}) {
     `rf=${event.rfId || '-'}`,
     `apiKey=${event.apiKey || '-'}`,
     `addr=${event.controllerAddress || '-'}`,
-  ].join(' ');
+  ];
+  if (event.apiEventKey && event.apiEventKey !== event.eventKey) {
+    parts.splice(2, 0, `apiEvent=${event.apiEventKey}`);
+  }
+  if (event.receiverOriginName) {
+    parts.splice(3, 0, `origin=${event.receiverOriginName}`);
+  }
+  return parts.join(' ');
+}
+
+function resolveMg3000ApiEventKey(eventPayload = {}) {
+  if (Object.prototype.hasOwnProperty.call(eventPayload, 'apiEventKey')) {
+    return String(eventPayload.apiEventKey || '').trim();
+  }
+
+  const eventKey = String(eventPayload.eventKey || '').trim();
+  if (['passagem', 'dispositivoAcionado', 'statusTrigger'].includes(eventKey)) return '';
+  if (eventKey === 'acionamentoPc') return 'baseAbriu';
+  return eventKey;
 }
 
 function buildControllerRuntimeKey({ apiKey, controllerAddress } = {}) {
@@ -801,7 +828,13 @@ function setChannelGateStatus(channelId, status, patch = {}) {
   };
 
   gateStatusByChannel.set(normalizedChannelId, next);
-  emitGatewayStatusUpdate('gate-status-updated', next);
+  if (next.gateStatus === 'closed' || next.doorStatus === true) {
+    clearChannelGateCooldown(normalizedChannelId, 'gate_closed', { emit: false });
+  }
+  emitGatewayStatusUpdate('gate-status-updated', {
+    ...next,
+    ...getChannelGateCooldownPayload(normalizedChannelId),
+  });
   return next;
 }
 
@@ -857,6 +890,126 @@ function channelMatchesMg3000Event(channel = {}, event = {}) {
   return true;
 }
 
+function getChannelPhysicalDoorKey(channel = {}) {
+  const channelId = normalizeChannelId(channel._id);
+  const doorDriver = normalizeDoorDriver(channel.doorDriver);
+
+  if (doorDriver === 'dozz_vehicle') {
+    const controllerAddress = normalizeControllerAddress(channel.vehicleAdd || channel.equipAdd);
+    const vehicleChannel = toIntegerOrNull(channel.vehicleChannel || channel.port);
+    if (controllerAddress && vehicleChannel !== null) {
+      return `dozz_vehicle:${controllerAddress}:ch:${vehicleChannel}`;
+    }
+    return channelId ? `channel:${channelId}` : null;
+  }
+
+  const controllerAddress = normalizeControllerAddress(channel.equipAdd);
+  const apiKey = String(channel.mg3000ApiKey || channel.apiKey || '').trim();
+  const receptorIndex = toIntegerOrNull(channel.receptorAdd);
+  const doorNumber = toIntegerOrNull(channel.port);
+  const controllerKey = controllerAddress || (apiKey ? `api:${apiKey}` : '');
+  if (controllerKey && receptorIndex !== null && doorNumber !== null) {
+    return `mg3000:${controllerKey}:rec:${receptorIndex}:door:${doorNumber}`;
+  }
+
+  return channelId ? `channel:${channelId}` : null;
+}
+
+function getChannelPhysicalDoorLabel(channel = {}) {
+  const doorDriver = normalizeDoorDriver(channel.doorDriver);
+  if (doorDriver === 'dozz_vehicle') {
+    const controllerAddress = normalizeControllerAddress(channel.vehicleAdd || channel.equipAdd) || 'sem-controladora';
+    const vehicleChannel = toIntegerOrNull(channel.vehicleChannel || channel.port);
+    return `Vehicle ${controllerAddress} canal ${vehicleChannel ?? '-'}`;
+  }
+
+  const controllerAddress = normalizeControllerAddress(channel.equipAdd) || 'sem-controladora';
+  const receptorIndex = toIntegerOrNull(channel.receptorAdd);
+  const doorNumber = toIntegerOrNull(channel.port);
+  return `MG3000 ${controllerAddress} rec ${receptorIndex ?? '-'} porta ${doorNumber ?? '-'}`;
+}
+
+function buildPhysicalDoorGroups(channels = []) {
+  const groupsByKey = new Map();
+  for (const channel of channels) {
+    const key = getChannelPhysicalDoorKey(channel);
+    if (!key) continue;
+    const existing = groupsByKey.get(key) || {
+      key,
+      name: getChannelPhysicalDoorLabel(channel),
+      doorDriver: normalizeDoorDriver(channel.doorDriver),
+      controllerAddress: normalizeControllerAddress(channel.equipAdd || channel.vehicleAdd),
+      receptorAdd: channel.receptorAdd ?? null,
+      door: channel.port ?? channel.vehicleChannel ?? null,
+      channelIds: [],
+      channels: [],
+    };
+    existing.channelIds.push(channel._id);
+    existing.channels.push({
+      channelId: channel._id,
+      doorKey: getChannelPhysicalDoorKey(channel),
+      name: channel.name || channel._id,
+      channelType: channel.channel_type || '',
+    });
+    groupsByKey.set(key, existing);
+  }
+
+  return Array.from(groupsByKey.values())
+    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+}
+
+function getInterlockDoorKeys(interlock = {}, channels = []) {
+  const directDoorKeys = Array.isArray(interlock.doorKeys)
+    ? interlock.doorKeys.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (directDoorKeys.length > 0) return Array.from(new Set(directDoorKeys));
+
+  const channelById = new Map(channels.map((channel) => [String(channel._id), channel]));
+  const legacyChannelIds = Array.isArray(interlock.channelIds)
+    ? interlock.channelIds.map(normalizeChannelId).filter(Boolean)
+    : [];
+  return Array.from(new Set(legacyChannelIds.map((channelId) => (
+    getChannelPhysicalDoorKey(channelById.get(channelId)) || `channel:${channelId}`
+  )).filter(Boolean)));
+}
+
+function getPhysicalDoorRuntimeState(doorKey, channels = []) {
+  const members = channels.filter((channel) => getChannelPhysicalDoorKey(channel) === doorKey);
+  if (members.length === 0) {
+    return {
+      gateStatus: 'unknown',
+      doorStatus: null,
+      updatedAt: 0,
+      channelIds: [],
+    };
+  }
+
+  const states = members.map((channel) => getChannelGateRuntime(channel._id));
+  const activeCooldown = members
+    .map((channel) => getActiveChannelGateCooldown(channel._id))
+    .find(Boolean);
+  if (activeCooldown) {
+    return {
+      gateStatus: 'opening',
+      doorStatus: false,
+      updatedAt: Date.now(),
+      channelIds: members.map((channel) => channel._id),
+      cooldown: activeCooldown,
+    };
+  }
+
+  const openState = states.find((state) => state.gateStatus === 'open' || state.gateStatus === 'opening');
+  if (openState) return { ...openState, channelIds: members.map((channel) => channel._id) };
+
+  const unknownState = states.find((state) => !state.gateStatus || state.gateStatus === 'unknown');
+  if (unknownState) return { ...unknownState, channelIds: members.map((channel) => channel._id) };
+
+  const newestState = states.reduce((best, state) => (
+    Number(state.updatedAt || 0) > Number(best.updatedAt || 0) ? state : best
+  ), states[0] || {});
+  return { ...newestState, channelIds: members.map((channel) => channel._id) };
+}
+
 async function findChannelsForMg3000Event(event = {}) {
   const channels = await findAsync(settingsDb, {});
   const matches = channels.filter((channel) => channelMatchesMg3000Event(channel, event));
@@ -879,17 +1032,176 @@ function normalizeInterlockDoc(payload = {}, existing = null) {
     ? payload.channelIds.map(normalizeChannelId).filter(Boolean)
     : [];
   const uniqueChannelIds = Array.from(new Set(channelIds));
+  const doorKeys = Array.isArray(payload.doorKeys)
+    ? payload.doorKeys.map((item) => String(item || '').trim()).filter(Boolean)
+    : (Array.isArray(existing?.doorKeys) ? existing.doorKeys : []);
+  const uniqueDoorKeys = Array.from(new Set(doorKeys));
   const now = Date.now();
   return {
     ...(existing || {}),
     name: String(payload.name || existing?.name || '').trim() || 'Intertravamento',
     enabled: payload.enabled !== false && String(payload.enabled || '').toLowerCase() !== 'false',
+    doorKeys: uniqueDoorKeys,
     channelIds: uniqueChannelIds,
     blockUnknown: payload.blockUnknown !== false && String(payload.blockUnknown || '').toLowerCase() !== 'false',
     staleAfterMs: Math.max(1000, Number(payload.staleAfterMs || existing?.staleAfterMs || 15000)),
     createdAt: existing?.createdAt || now,
     updatedAt: now,
   };
+}
+
+function normalizeInterlockSettingsDoc(payload = {}, existing = null) {
+  const now = Date.now();
+  return {
+    ...(existing || {}),
+    _id: INTERLOCK_SETTINGS_ID,
+    type: 'settings',
+    gateCommandCooldownMs: normalizeDurationMs(
+      payload.gateCommandCooldownMs ?? existing?.gateCommandCooldownMs,
+      DEFAULT_GATE_COMMAND_COOLDOWN_MS
+    ),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  };
+}
+
+async function getInterlockSettings() {
+  const existing = await findOneAsync(interlocksDb, { _id: INTERLOCK_SETTINGS_ID }).catch(() => null);
+  return normalizeInterlockSettingsDoc(existing || {}, existing);
+}
+
+async function saveInterlockSettings(payload = {}) {
+  const existing = await findOneAsync(interlocksDb, { _id: INTERLOCK_SETTINGS_ID }).catch(() => null);
+  const doc = normalizeInterlockSettingsDoc(payload, existing);
+  await updateAsync(interlocksDb, { _id: INTERLOCK_SETTINGS_ID }, doc, { upsert: true });
+  return doc;
+}
+
+function getChannelGateCooldownPayload(channelId) {
+  const normalizedChannelId = normalizeChannelId(channelId);
+  if (!normalizedChannelId) return {
+    cooldownActive: false,
+    cooldownRemainingMs: 0,
+    cooldownExpiresAt: null,
+  };
+
+  const cooldown = gateCooldownByChannel.get(normalizedChannelId);
+  if (!cooldown) return {
+    cooldownActive: false,
+    cooldownRemainingMs: 0,
+    cooldownExpiresAt: null,
+  };
+
+  const remainingMs = Math.max(0, Number(cooldown.expiresAt || 0) - Date.now());
+  return {
+    cooldownActive: remainingMs > 0,
+    cooldownRemainingMs: remainingMs,
+    cooldownExpiresAt: cooldown.expiresAtIso || null,
+    cooldownStartedAt: cooldown.startedAtIso || null,
+    cooldownReason: cooldown.reason || null,
+  };
+}
+
+function emitChannelGateState(channelId, extra = {}) {
+  const normalizedChannelId = normalizeChannelId(channelId);
+  if (!normalizedChannelId) return;
+  const state = getChannelGateRuntime(normalizedChannelId);
+  emitGatewayStatusUpdate('gate-status-updated', {
+    ...state,
+    ...getChannelGateCooldownPayload(normalizedChannelId),
+    ...extra,
+  });
+}
+
+function clearChannelGateCooldown(channelId, reason = 'cleared', options = {}) {
+  const normalizedChannelId = normalizeChannelId(channelId);
+  if (!normalizedChannelId) return false;
+
+  const cooldown = gateCooldownByChannel.get(normalizedChannelId);
+  if (!cooldown) return false;
+  if (cooldown.timer) clearTimeout(cooldown.timer);
+  gateCooldownByChannel.delete(normalizedChannelId);
+  console.log(`[gate-cooldown] liberado channel=${normalizedChannelId} reason=${reason}`);
+  if (options.emit !== false) {
+    emitChannelGateState(normalizedChannelId, {
+      cooldownActive: false,
+      cooldownRemainingMs: 0,
+      cooldownExpiresAt: null,
+      cooldownReason: reason,
+    });
+  }
+  return true;
+}
+
+function getActiveChannelGateCooldown(channelId) {
+  const normalizedChannelId = normalizeChannelId(channelId);
+  if (!normalizedChannelId) return null;
+
+  const cooldown = gateCooldownByChannel.get(normalizedChannelId);
+  if (!cooldown) return null;
+
+  const state = getChannelGateRuntime(normalizedChannelId);
+  const statusUpdatedAt = Number(state?.updatedAt || 0);
+  if ((state?.gateStatus === 'closed' || state?.doorStatus === true) && statusUpdatedAt >= Number(cooldown.startedAt || 0)) {
+    clearChannelGateCooldown(normalizedChannelId, 'gate_closed');
+    return null;
+  }
+
+  const remainingMs = Number(cooldown.expiresAt || 0) - Date.now();
+  if (remainingMs <= 0) {
+    clearChannelGateCooldown(normalizedChannelId, 'expired');
+    return null;
+  }
+
+  return {
+    ...cooldown,
+    remainingMs,
+  };
+}
+
+function startChannelGateCooldown(channelId, cooldownMs, reason = 'command_open') {
+  const normalizedChannelId = normalizeChannelId(channelId);
+  const safeCooldownMs = normalizeDurationMs(cooldownMs, DEFAULT_GATE_COMMAND_COOLDOWN_MS);
+  if (!normalizedChannelId || safeCooldownMs <= 0) return null;
+
+  clearChannelGateCooldown(normalizedChannelId, 'replaced', { emit: false });
+
+  const startedAt = Date.now();
+  const expiresAt = startedAt + safeCooldownMs;
+  const cooldown = {
+    channelId: normalizedChannelId,
+    reason,
+    startedAt,
+    startedAtIso: new Date(startedAt).toISOString(),
+    expiresAt,
+    expiresAtIso: new Date(expiresAt).toISOString(),
+    durationMs: safeCooldownMs,
+    timer: setTimeout(() => {
+      clearChannelGateCooldown(normalizedChannelId, 'expired');
+    }, safeCooldownMs),
+  };
+  if (cooldown.timer?.unref) cooldown.timer.unref();
+  gateCooldownByChannel.set(normalizedChannelId, cooldown);
+  console.log(`[gate-cooldown] ativo channel=${normalizedChannelId} durationMs=${safeCooldownMs} reason=${reason}`);
+  emitChannelGateState(normalizedChannelId);
+  return cooldown;
+}
+
+async function startPhysicalDoorCooldownForChannel(channelId, cooldownMs, reason = 'command_open') {
+  const normalizedChannelId = normalizeChannelId(channelId);
+  const channels = await findAsync(settingsDb, {});
+  const sourceChannel = channels.find((channel) => String(channel._id) === normalizedChannelId);
+  const doorKey = getChannelPhysicalDoorKey(sourceChannel) || `channel:${normalizedChannelId}`;
+  const memberChannelIds = channels
+    .filter((channel) => getChannelPhysicalDoorKey(channel) === doorKey)
+    .map((channel) => channel._id)
+    .filter(Boolean);
+  const uniqueChannelIds = Array.from(new Set(memberChannelIds.length > 0 ? memberChannelIds : [normalizedChannelId]));
+
+  console.log(`[gate-cooldown] aplicando por porta doorKey=${doorKey} canais=${uniqueChannelIds.join(',')}`);
+  return uniqueChannelIds.map((memberChannelId) => (
+    startChannelGateCooldown(memberChannelId, cooldownMs, `${reason}:door`)
+  )).filter(Boolean);
 }
 
 function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown) {
@@ -904,16 +1216,21 @@ async function evaluateChannelInterlock(channelId) {
   const normalizedChannelId = normalizeChannelId(channelId);
   if (!normalizedChannelId) return { allowed: true };
 
+  const channels = await findAsync(settingsDb, {});
+  const targetChannel = channels.find((channel) => String(channel._id) === normalizedChannelId);
+  const targetDoorKey = getChannelPhysicalDoorKey(targetChannel) || `channel:${normalizedChannelId}`;
   const interlocks = await findAsync(interlocksDb, { enabled: { $ne: false } });
   for (const interlock of interlocks) {
-    const channelIds = Array.isArray(interlock.channelIds) ? interlock.channelIds.map(normalizeChannelId) : [];
-    if (!channelIds.includes(normalizedChannelId)) continue;
+    if (interlock?._id === INTERLOCK_SETTINGS_ID || interlock?.type === 'settings') continue;
+
+    const doorKeys = getInterlockDoorKeys(interlock, channels);
+    if (!doorKeys.includes(targetDoorKey)) continue;
 
     const staleAfterMs = Math.max(1000, Number(interlock.staleAfterMs || 15000));
     const blockUnknown = interlock.blockUnknown !== false;
-    for (const linkedChannelId of channelIds) {
-      if (!linkedChannelId || linkedChannelId === normalizedChannelId) continue;
-      const linkedState = getChannelGateRuntime(linkedChannelId);
+    for (const linkedDoorKey of doorKeys) {
+      if (!linkedDoorKey || linkedDoorKey === targetDoorKey) continue;
+      const linkedState = getPhysicalDoorRuntimeState(linkedDoorKey, channels);
       if (!isGateStateBlocking(linkedState, staleAfterMs, blockUnknown)) continue;
 
       return {
@@ -921,7 +1238,8 @@ async function evaluateChannelInterlock(channelId) {
         reason: 'interlock_blocked',
         interlockId: interlock._id,
         interlockName: interlock.name,
-        blockingChannelId: linkedChannelId,
+        blockingDoorKey: linkedDoorKey,
+        blockingChannelId: linkedState.channelIds?.[0] || null,
         blockingGateStatus: linkedState.gateStatus || 'unknown',
         blockingUpdatedAt: linkedState.updatedAtIso || null,
       };
@@ -943,21 +1261,58 @@ function mgBcdToDecimal(bcdValue) {
   return ((bcdValue & 0xF0) >> 4) * 10 + (bcdValue & 0x0F);
 }
 
+function getMg3000EventCode(frame) {
+  return (frame[0] & 0xF0) >> 4;
+}
+
+function getMg3000ReceiverOrigin(frame) {
+  return (frame[10] & 0xF0) >> 4;
+}
+
+function getMg3000ReceiverOriginName(origin) {
+  switch (origin) {
+    case 0x01: return 'RF';
+    case 0x02: return 'TA';
+    case 0x03: return 'CT';
+    case 0x06: return 'TP';
+    default: return origin ? `0x${origin.toString(16).toUpperCase()}` : null;
+  }
+}
+
 function getMg3000EventType(frame) {
-  const eventType = (frame[0] & 0xF0) >> 4;
+  const eventType = getMg3000EventCode(frame);
+  const receiverOrigin = getMg3000ReceiverOrigin(frame);
   switch (eventType) {
-    case 0x00: return 'acessoRf';
-    case 0x01: return getMg3000CaronaFlag(frame) ? 'carona' : 'statusTrigger';
-    case 0x06: return 'baseAbriu';
+    case 0x00:
+      if (receiverOrigin === 0x06) return 'tagRFID';
+      if (receiverOrigin === 0x01) return 'acessoRf';
+      return 'dispositivoAcionado';
+    case 0x01: return 'passagem';
+    case 0x06: return 'acionamentoPc';
     case 0x08: return 'clonagem';
     case 0x09: return 'panicoRf';
-    case 0x0C: return 'receptor';
+    case 0x0C: return 'eventoReceptor';
     default: return null;
   }
 }
 
 function getMg3000CaronaFlag(frame) {
   return (frame[14] & 0x08) !== 0;
+}
+
+function getMg3000ButtonIndex(frame) {
+  return (frame[14] & 0x30) >> 4;
+}
+
+function getMg3000PassageIndex(frame) {
+  return frame[14] & 0b00000111;
+}
+
+function getMg3000SensorFlags(frame) {
+  return {
+    sensor1Closed: (frame[15] & 0x01) !== 0,
+    sensor2Closed: (frame[15] & 0x02) !== 0,
+  };
 }
 
 function getMg3000ReceiverEvent(frame) {
@@ -997,22 +1352,27 @@ function parseMg3000Frame(rawData) {
   const frame = data.slice(3, -1);
   if (frame.length < 16) return null;
 
+  const eventCode = getMg3000EventCode(frame);
   const eventType = getMg3000EventType(frame);
   if (!eventType) return null;
 
+  const receiverOrigin = getMg3000ReceiverOrigin(frame);
   const receptorIndex = frame[10] & 0x0F;
   const timestamp = parseMg3000EventDate(frame).toISOString();
   const base = {
+    eventCode,
     eventType,
+    receiverOrigin,
+    receiverOriginName: getMg3000ReceiverOriginName(receiverOrigin),
     receptorIndex,
     receptorAdd: receptorIndex + 1,
     timestamp,
     rawHex: data.toString('hex'),
   };
 
-  if (eventType === 'receptor') {
+  if (eventType === 'eventoReceptor') {
     const eventKey = getMg3000ReceiverEvent(frame);
-    const doorIndex = (frame[14] & 0x30) >> 4;
+    const doorIndex = getMg3000ButtonIndex(frame);
     const doorNumber = doorIndex + 1;
     const doorStatus = eventKey === 'portaFechou'
       ? true
@@ -1020,6 +1380,7 @@ function parseMg3000Frame(rawData) {
     return {
       ...base,
       eventKey,
+      apiEventKey: eventKey,
       doorIndex,
       doorNumber,
       doorStatus,
@@ -1027,12 +1388,29 @@ function parseMg3000Frame(rawData) {
     };
   }
 
-  const doorIndex = eventType === 'carona'
-    ? (frame[14] & 0b00000111)
-    : ((frame[14] & 0x30) >> 4);
+  let eventKey = eventType;
+  let apiEventKey = eventType;
+  let doorIndex = getMg3000ButtonIndex(frame);
+  const extra = {};
+
+  if (eventType === 'passagem') {
+    const carona = getMg3000CaronaFlag(frame);
+    doorIndex = getMg3000PassageIndex(frame);
+    eventKey = carona ? 'carona' : 'passagem';
+    apiEventKey = carona ? 'carona' : null;
+    extra.carona = carona;
+  } else if (eventType === 'acionamentoPc') {
+    apiEventKey = 'baseAbriu';
+  } else if (eventType === 'dispositivoAcionado') {
+    apiEventKey = null;
+    extra.sensorStatus = getMg3000SensorFlags(frame);
+  }
+
   return {
     ...base,
-    eventKey: eventType,
+    ...extra,
+    eventKey,
+    apiEventKey,
     rfId: parseMg3000Serial(frame),
     doorIndex,
     doorNumber: doorIndex + 1,
@@ -1045,8 +1423,9 @@ async function forwardMg3000EventToApiRedis(eventPayload) {
     console.warn(`[mg3000-gateway] forward desabilitado sem MG3000_EVENT_URL event=${describeMg300Event(eventPayload)}`);
     return;
   }
-  if (eventPayload.eventKey === 'statusTrigger') {
-    console.log(`[mg3000-gateway] forward ignorado: statusTrigger local-only ${describeMg300Event(eventPayload)}`);
+  const forwardEventKey = resolveMg3000ApiEventKey(eventPayload);
+  if (!forwardEventKey) {
+    console.log(`[mg3000-gateway] forward ignorado: evento local-only ${describeMg300Event(eventPayload)}`);
     return;
   }
 
@@ -1056,11 +1435,18 @@ async function forwardMg3000EventToApiRedis(eventPayload) {
       headers['x-internal-token'] = MG300_GATEWAY_EVENT_FORWARD_TOKEN;
     }
 
-    console.log(`[mg3000-gateway] forward -> ${API_MG3000_EVENT_ENDPOINT} ${describeMg300Event(eventPayload)}`);
+    const forwardPayload = {
+      ...eventPayload,
+      eventKey: forwardEventKey,
+      originalEventKey: eventPayload.eventKey || null,
+      originalEventType: eventPayload.eventType || null,
+    };
+
+    console.log(`[mg3000-gateway] forward -> ${API_MG3000_EVENT_ENDPOINT} ${describeMg300Event(forwardPayload)}`);
     const resp = await fetch(API_MG3000_EVENT_ENDPOINT, {
       method: 'POST',
       headers,
-      body: JSON.stringify(eventPayload),
+      body: JSON.stringify(forwardPayload),
     });
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '');
@@ -1255,6 +1641,7 @@ async function buildGatewayStatusPayload() {
     const controllerRuntime = findOnlineMg3000RuntimeForChannel(channel);
     const controllerOnline = runtime.controllerOnline === true || controllerRuntime?.online === true;
     const process = processByChannel.get(channel._id) || { channelId: channel._id, status: 'stopped' };
+    const cooldown = getChannelGateCooldownPayload(channel._id);
     const item = {
       channelId: channel._id,
       name: channel.name || channel._id,
@@ -1270,6 +1657,7 @@ async function buildGatewayStatusPayload() {
       door: runtime.door ?? channel.port ?? null,
       updatedAt: runtime.updatedAtIso || controllerRuntime?.updatedAtIso || null,
       lastEventKey: runtime.lastEventKey || controllerRuntime?.lastEventKey || null,
+      ...cooldown,
     };
     channelStates[channel._id] = item;
     channelDoorStatus[channel._id] = item.doorStatus;
@@ -2486,9 +2874,11 @@ app.post('/api/mg3000/events', async (req, res) => {
     const doorStatus = body.doorStatus === true || body.status === true || body.gateStatus === 'closed'
       ? true
       : (body.doorStatus === false || body.status === false || body.gateStatus === 'open' ? false : null);
+    const normalizedEventKey = eventKey || (doorStatus === true ? 'portaFechou' : 'portaAbriu');
     const payload = {
       ...body,
-      eventKey: eventKey || (doorStatus === true ? 'portaFechou' : 'portaAbriu'),
+      eventKey: normalizedEventKey,
+      apiEventKey: resolveMg3000ApiEventKey({ eventKey: normalizedEventKey }) || null,
       receptorAdd: toIntegerOrNull(body.receptorAdd ?? body.receptor) ?? 1,
       doorNumber: toIntegerOrNull(body.door ?? body.port ?? body.doorNumber) ?? 1,
       controllerAddress: body.controllerAddress || body.equipAdd || null,
@@ -2510,9 +2900,32 @@ app.post('/api/mg3000/events', async (req, res) => {
 
 app.get('/api/interlocks', async (req, res) => {
   try {
-    const docs = await findAsync(interlocksDb, {});
+    const channels = await findAsync(settingsDb, {});
+    const docs = (await findAsync(interlocksDb, {}))
+      .filter((doc) => doc?._id !== INTERLOCK_SETTINGS_ID && doc?.type !== 'settings');
     docs.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
-    res.json({ ok: true, interlocks: docs });
+    res.json({
+      ok: true,
+      interlocks: docs,
+      settings: await getInterlockSettings(),
+      doors: buildPhysicalDoorGroups(channels),
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error?.message || String(error) });
+  }
+});
+
+app.get('/api/interlocks/settings', async (req, res) => {
+  try {
+    res.json({ ok: true, settings: await getInterlockSettings() });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error?.message || String(error) });
+  }
+});
+
+app.post('/api/interlocks/settings', async (req, res) => {
+  try {
+    res.json({ ok: true, settings: await saveInterlockSettings(req.body || {}) });
   } catch (error) {
     res.status(500).json({ ok: false, error: error?.message || String(error) });
   }
@@ -2520,12 +2933,16 @@ app.get('/api/interlocks', async (req, res) => {
 
 app.post('/api/interlocks', async (req, res) => {
   try {
+    if (String(req.body?._id || '') === INTERLOCK_SETTINGS_ID) {
+      return res.status(400).json({ ok: false, error: 'ID reservado para configuração global.' });
+    }
     const existing = req.body?._id
       ? await findOneAsync(interlocksDb, { _id: String(req.body._id) }).catch(() => null)
       : null;
     const doc = normalizeInterlockDoc(req.body || {}, existing);
-    if (doc.channelIds.length < 2) {
-      return res.status(400).json({ ok: false, error: 'Selecione pelo menos 2 canais.' });
+    const interlockMemberCount = doc.doorKeys.length || doc.channelIds.length;
+    if (interlockMemberCount < 2) {
+      return res.status(400).json({ ok: false, error: 'Selecione pelo menos 2 portas.' });
     }
 
     if (existing?._id) {
@@ -2549,6 +2966,14 @@ app.delete('/api/interlocks/:interlockId', async (req, res) => {
   }
 });
 
+app.get('/api/doors', async (req, res) => {
+  try {
+    res.json({ ok: true, doors: buildPhysicalDoorGroups(await findAsync(settingsDb, {})) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error?.message || String(error) });
+  }
+});
+
 // Endpoint para obter um canal específico
 app.get('/api/channels/:channelId', (req, res) => {
   const channelId = req.params.channelId;
@@ -2566,12 +2991,15 @@ app.all('/api/channels/:channelId/open', async (req, res) => {
     await openDoor(req.params.channelId);
     res.json({ ok: true });
   } catch (error) {
-    const statusCode = error?.code === 'interlock_blocked' ? 409 : 500;
+    const statusCode = error?.code === 'interlock_blocked'
+      ? 409
+      : (error?.code === 'gate_cooldown' ? 429 : 500);
     res.status(statusCode).json({
       ok: false,
       code: error?.code || 'open_failed',
       error: error?.message || String(error),
       interlock: error?.interlock || null,
+      cooldown: error?.cooldown || null,
     });
   }
 });
@@ -3233,6 +3661,16 @@ function handlePlateDetection(channelId, plateData, direction, timestamp, metada
         releaseLock();
         return;
       }
+
+      const cooldown = getActiveChannelGateCooldown(channelId);
+      if (cooldown) {
+        if (processes[channelId]) {
+          processes[channelId].lastPlateDetectionTime = Date.now();
+        }
+        console.log(`[gate-cooldown] ignorando placa no canal ${channelId}; restanteMs=${Math.ceil(cooldown.remainingMs)} reason=${cooldown.reason || '-'}`);
+        releaseLock();
+        return;
+      }
     }
 
     platesDb.find({}, (err, docs) => {
@@ -3682,15 +4120,35 @@ async function openDoorViaDozzVehicle(canal, channelId) {
   }
 }
 
+async function startConfiguredGateCooldown(channelId, reason = 'command_open') {
+  const settings = await getInterlockSettings();
+  return startPhysicalDoorCooldownForChannel(channelId, settings.gateCommandCooldownMs, reason);
+}
+
 // Função para abrir porta (adaptar conforme necessidade)
 async function openDoor(channelId) {
   return enqueueGateDecision(async () => {
     try {
       console.log('Opening Door');
 
+      const cooldown = getActiveChannelGateCooldown(channelId);
+      if (cooldown) {
+        const remainingMs = Math.ceil(cooldown.remainingMs);
+        const error = new Error(`Canal em cooldown de abertura por mais ${Math.ceil(remainingMs / 1000)}s.`);
+        error.code = 'gate_cooldown';
+        error.cooldown = {
+          channelId: normalizeChannelId(channelId),
+          remainingMs,
+          expiresAt: cooldown.expiresAtIso || null,
+          reason: cooldown.reason || null,
+        };
+        console.warn('[gate-cooldown] abertura bloqueada:', error.cooldown);
+        throw error;
+      }
+
       const interlock = await evaluateChannelInterlock(channelId);
       if (!interlock.allowed) {
-        const error = new Error(`Intertravamento ativo: canal ${interlock.blockingChannelId} está ${interlock.blockingGateStatus}.`);
+        const error = new Error(`Intertravamento ativo: porta ${interlock.blockingDoorKey || interlock.blockingChannelId} está ${interlock.blockingGateStatus}.`);
         error.code = 'interlock_blocked';
         error.interlock = interlock;
         console.warn('[interlock] abertura bloqueada:', interlock);
@@ -3715,6 +4173,7 @@ async function openDoor(channelId) {
       const doorDriver = normalizeDoorDriver(canal.doorDriver);
       if (doorDriver === 'dozz_vehicle') {
         await openDoorViaDozzVehicle(canal, channelId);
+        await startConfiguredGateCooldown(channelId, 'command_open:dozz_vehicle');
         console.log(`Comando HTTP enviado para Dozz Vehicle no canal ${channelId}.`);
         return;
       }
@@ -3741,6 +4200,7 @@ async function openDoor(channelId) {
         }
       });
 
+      await startConfiguredGateCooldown(channelId, 'command_open:mg3000');
       console.log(`Comando enviado para abrir a porta no canal ${channelId}.`);
     } catch (error) {
       console.error(`Erro ao enviar comando de abertura no canal ${channelId}:`, error);

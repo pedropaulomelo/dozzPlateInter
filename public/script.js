@@ -10,6 +10,7 @@ let cadastrosData = [];
 let cadastrosVehiclesData = [];
 let gateStatusByChannel = {};
 let interlocksCache = [];
+let interlockSettingsCache = { gateCommandCooldownMs: 15000 };
 // (Opcional) Um mapeamento de grupo -> set de unidades
 let grupoUnidadeMapCadastros = {};
 const CADASTROS_DEBUG_ENABLED = (() => {
@@ -504,6 +505,115 @@ const categoryLabels = {
       : { label: 'Offline', className: 'controller-offline' };
   }
 
+  function formatDurationMs(ms) {
+    const safeMs = Math.max(0, Number(ms || 0));
+    if (safeMs < 1000) return '0s';
+    return `${Math.ceil(safeMs / 1000)}s`;
+  }
+
+  function cooldownStatusMeta(state = {}) {
+    const expiresAtMs = state.cooldownExpiresAt ? Date.parse(state.cooldownExpiresAt) : NaN;
+    const remainingMs = Number.isFinite(expiresAtMs)
+      ? Math.max(0, expiresAtMs - Date.now())
+      : Number(state.cooldownRemainingMs || 0);
+    const active = state.cooldownActive === true && remainingMs > 0;
+    return active
+      ? { label: `Cooldown ${formatDurationMs(remainingMs)}`, className: 'cooldown-active' }
+      : { label: 'Pronto', className: 'cooldown-ready' };
+  }
+
+  function normalizeInterlockSettings(settings = {}) {
+    const parsed = Number(settings.gateCommandCooldownMs);
+    return {
+      gateCommandCooldownMs: Number.isFinite(parsed)
+        ? Math.max(1000, Math.round(parsed))
+        : 15000,
+    };
+  }
+
+  function normalizeDoorAddress(value) {
+    return String(value || '')
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/.*$/g, '')
+      .replace(/:\d+$/g, '')
+      .replace(/^::ffff:/, '');
+  }
+
+  function toDoorInteger(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function normalizeDoorDriverValue(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return ['dozz_vehicle', 'dozzvehicle', 'vehicle'].includes(normalized) ? 'dozz_vehicle' : 'mg3000';
+  }
+
+  function getChannelDoorKey(channel = {}) {
+    const driver = normalizeDoorDriverValue(channel.doorDriver);
+    if (driver === 'dozz_vehicle') {
+      const controller = normalizeDoorAddress(channel.vehicleAdd || channel.equipAdd);
+      const vehicleChannel = toDoorInteger(channel.vehicleChannel || channel.port);
+      if (controller && vehicleChannel !== null) return `dozz_vehicle:${controller}:ch:${vehicleChannel}`;
+      return channel._id ? `channel:${channel._id}` : '';
+    }
+
+    const controller = normalizeDoorAddress(channel.equipAdd);
+    const apiKey = String(channel.mg3000ApiKey || channel.apiKey || '').trim();
+    const rec = toDoorInteger(channel.receptorAdd);
+    const door = toDoorInteger(channel.port);
+    const controllerKey = controller || (apiKey ? `api:${apiKey}` : '');
+    if (controllerKey && rec !== null && door !== null) return `mg3000:${controllerKey}:rec:${rec}:door:${door}`;
+    return channel._id ? `channel:${channel._id}` : '';
+  }
+
+  function getChannelDoorLabel(channel = {}) {
+    const driver = normalizeDoorDriverValue(channel.doorDriver);
+    if (driver === 'dozz_vehicle') {
+      const controller = normalizeDoorAddress(channel.vehicleAdd || channel.equipAdd) || 'sem-controladora';
+      const vehicleChannel = toDoorInteger(channel.vehicleChannel || channel.port);
+      return `Vehicle ${controller} canal ${vehicleChannel ?? '-'}`;
+    }
+
+    const controller = normalizeDoorAddress(channel.equipAdd) || 'sem-controladora';
+    const rec = toDoorInteger(channel.receptorAdd);
+    const door = toDoorInteger(channel.port);
+    return `MG3000 ${controller} rec ${rec ?? '-'} porta ${door ?? '-'}`;
+  }
+
+  function buildInterlockDoors(channels = []) {
+    const byKey = new Map();
+    channels.forEach((channel) => {
+      const key = getChannelDoorKey(channel);
+      if (!key) return;
+      const item = byKey.get(key) || {
+        key,
+        name: getChannelDoorLabel(channel),
+        channelIds: [],
+        channels: [],
+      };
+      item.channelIds.push(channel._id);
+      item.channels.push({
+        channelId: channel._id,
+        name: channel.name || channel._id,
+      });
+      byKey.set(key, item);
+    });
+    return Array.from(byKey.values()).sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+  }
+
+  function getInterlockDoorKeys(interlock = {}, channels = []) {
+    if (Array.isArray(interlock.doorKeys) && interlock.doorKeys.length) {
+      return interlock.doorKeys.map(String);
+    }
+    const channelById = new Map(channels.map((channel) => [String(channel._id), channel]));
+    return Array.from(new Set((interlock.channelIds || []).map((channelId) => (
+      getChannelDoorKey(channelById.get(String(channelId))) || `channel:${channelId}`
+    )).filter(Boolean)));
+  }
+
   function applyGatewayStatusPayload(payload = {}) {
     const next = {};
     const channels = Array.isArray(payload.channels)
@@ -552,8 +662,18 @@ const categoryLabels = {
 
   function setupGatewayStatusSocket() {
     socket.off('gate-status-updated');
+    socket.off('gate-cooldown-updated');
     socket.off('mg3000-status-updated');
     socket.on('gate-status-updated', (state) => {
+      if (!state?.channelId) return;
+      gateStatusByChannel[state.channelId] = {
+        ...(gateStatusByChannel[state.channelId] || {}),
+        ...state,
+      };
+      updateGateStatusRows();
+      updateInterlockRuntimeStatus();
+    });
+    socket.on('gate-cooldown-updated', (state) => {
       if (!state?.channelId) return;
       gateStatusByChannel[state.channelId] = {
         ...(gateStatusByChannel[state.channelId] || {}),
@@ -1329,7 +1449,12 @@ function getStatusColor(status) {
         fetchJson('/api/interlocks'),
       ]);
       interlocksCache = Array.isArray(interlocksPayload.interlocks) ? interlocksPayload.interlocks : [];
-      renderInterlocksScreen(Array.isArray(channels) ? channels : []);
+      interlockSettingsCache = normalizeInterlockSettings(interlocksPayload.settings || {});
+      const safeChannels = Array.isArray(channels) ? channels : [];
+      const doors = Array.isArray(interlocksPayload.doors) && interlocksPayload.doors.length
+        ? interlocksPayload.doors
+        : buildInterlockDoors(safeChannels);
+      renderInterlocksScreen(safeChannels, doors);
       setupGatewayStatusSocket();
       feather.replace();
     } catch (error) {
@@ -1338,10 +1463,24 @@ function getStatusColor(status) {
     }
   }
 
-  function renderInterlocksScreen(channels) {
+  function renderInterlocksScreen(channels, doors = buildInterlockDoors(channels)) {
     const mainContent = document.getElementById('main-content');
     mainContent.innerHTML = `
       <div class="interlocks-layout">
+        <section class="interlock-section">
+          <div class="interlock-header-row">
+            <h2>Configuração global</h2>
+          </div>
+          <form id="interlock-settings-form" class="interlock-form">
+            <label>
+              Cooldown após abertura (ms)
+              <input type="number" id="interlock-cooldown-ms" value="${escapeHtml(String(interlockSettingsCache.gateCommandCooldownMs || 15000))}" min="1000" max="600000" step="1000">
+            </label>
+            <div class="interlock-actions-row">
+              <button type="submit" class="primary-button">Salvar configuração</button>
+            </div>
+          </form>
+        </section>
         <section class="interlock-section">
           <div class="interlock-header-row">
             <h2>Intertravamentos</h2>
@@ -1362,7 +1501,7 @@ function getStatusColor(status) {
               </label>
             </div>
             <div class="interlock-channel-list">
-              ${renderInterlockChannelList(channels)}
+              ${renderInterlockDoorList(doors)}
             </div>
             <div class="interlock-actions-row">
               <button type="submit" class="primary-button">Salvar</button>
@@ -1370,69 +1509,92 @@ function getStatusColor(status) {
           </form>
         </section>
         <section class="interlock-section">
-          <h3>Status dos canais</h3>
+          <h3>Status das portas</h3>
           <div id="interlock-runtime-status" class="interlock-status-grid">
-            ${renderInterlockRuntimeStatus(channels)}
+            ${renderInterlockRuntimeStatus(doors)}
           </div>
         </section>
         <section class="interlock-section">
           <h3>Regras salvas</h3>
           <div id="interlock-table-wrap">
-            ${renderInterlockTable(channels)}
+            ${renderInterlockTable(channels, doors)}
           </div>
         </section>
       </div>
     `;
 
+    document.getElementById('interlock-settings-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveInterlockSettings();
+    });
     document.getElementById('interlock-form').addEventListener('submit', (event) => {
       event.preventDefault();
-      saveInterlockFromForm(channels);
+      saveInterlockFromForm(channels, doors);
     });
     document.getElementById('clear-interlock-form').addEventListener('click', clearInterlockForm);
     document.querySelectorAll('.interlock-edit').forEach((button) => {
-      button.addEventListener('click', () => handleEditInterlock(button.dataset.id));
+      button.addEventListener('click', () => handleEditInterlock(button.dataset.id, channels));
     });
     document.querySelectorAll('.interlock-delete').forEach((button) => {
-      button.addEventListener('click', () => handleDeleteInterlock(button.dataset.id, channels));
+      button.addEventListener('click', () => handleDeleteInterlock(button.dataset.id, channels, doors));
     });
     updateInterlockRuntimeStatus();
   }
 
-  function renderInterlockChannelList(channels) {
-    if (!channels.length) return '<div class="empty-state">Nenhum canal configurado.</div>';
-    return channels.map((channel) => `
+  function renderInterlockDoorList(doors) {
+    if (!doors.length) return '<div class="empty-state">Nenhuma porta configurada.</div>';
+    return doors.map((door) => `
       <label class="interlock-channel-option">
-        <input type="checkbox" name="interlock-channel" value="${escapeHtml(channel._id)}">
-        <span>${escapeHtml(channel.name || channel._id)}</span>
+        <input type="checkbox" name="interlock-door" value="${escapeHtml(door.key)}">
+        <span>
+          <strong>${escapeHtml(door.name || door.key)}</strong>
+          <small>${(door.channels || []).map((channel) => escapeHtml(channel.name || channel.channelId)).join(', ')}</small>
+        </span>
       </label>
     `).join('');
   }
 
-  function renderInterlockRuntimeStatus(channels) {
-    if (!channels.length) return '<div class="empty-state">Nenhum canal configurado.</div>';
-    return channels.map((channel) => {
-      const state = gateStatusByChannel[channel._id] || {};
+  function getDoorRuntimeState(door = {}) {
+    const channelIds = Array.isArray(door.channelIds)
+      ? door.channelIds
+      : (door.channels || []).map((channel) => channel.channelId).filter(Boolean);
+    const states = channelIds.map((channelId) => gateStatusByChannel[channelId] || {});
+    const cooldownState = states.find((state) => state.cooldownActive === true);
+    if (cooldownState) return cooldownState;
+    return states.find((state) => ['open', 'opening'].includes(String(state.gateStatus || '').toLowerCase()))
+      || states.find((state) => !state.gateStatus || String(state.gateStatus).toLowerCase() === 'unknown')
+      || states[0]
+      || {};
+  }
+
+  function renderInterlockRuntimeStatus(doors) {
+    if (!doors.length) return '<div class="empty-state">Nenhuma porta configurada.</div>';
+    return doors.map((door) => {
+      const state = getDoorRuntimeState(door);
       const gateMeta = gateStatusMeta(state.gateStatus);
       const controllerMeta = controllerStatusMeta(state.controllerOnline === true);
+      const cooldownMeta = cooldownStatusMeta(state);
       return `
-        <div class="interlock-status-item" data-channel-id="${escapeHtml(channel._id)}">
-          <strong>${escapeHtml(channel.name || channel._id)}</strong>
+        <div class="interlock-status-item" data-door-key="${escapeHtml(door.key)}" data-channel-ids="${escapeHtml((door.channelIds || []).join(','))}">
+          <strong>${escapeHtml(door.name || door.key)}</strong>
+          <small>${(door.channels || []).map((channel) => escapeHtml(channel.name || channel.channelId)).join(', ')}</small>
           <span class="controller-status-pill ${controllerMeta.className}">${controllerMeta.label}</span>
           <span class="gate-status-pill ${gateMeta.className}">${gateMeta.label}</span>
+          <span class="cooldown-status-pill ${cooldownMeta.className}">${cooldownMeta.label}</span>
         </div>
       `;
     }).join('');
   }
 
-  function renderInterlockTable(channels) {
-    const channelNameById = new Map(channels.map((channel) => [String(channel._id), channel.name || channel._id]));
+  function renderInterlockTable(channels, doors = buildInterlockDoors(channels)) {
+    const doorNameByKey = new Map(doors.map((door) => [String(door.key), door.name || door.key]));
     if (!interlocksCache.length) return '<div class="empty-state">Nenhum intertravamento criado.</div>';
     return `
       <table class="styled-table">
         <thead>
           <tr>
             <th>Nome</th>
-            <th>Canais</th>
+            <th>Portas</th>
             <th>Ativo</th>
             <th>Ações</th>
           </tr>
@@ -1441,7 +1603,7 @@ function getStatusColor(status) {
           ${interlocksCache.map((interlock) => `
             <tr>
               <td>${escapeHtml(interlock.name)}</td>
-              <td>${(interlock.channelIds || []).map((id) => escapeHtml(channelNameById.get(String(id)) || id)).join(', ')}</td>
+              <td>${getInterlockDoorKeys(interlock, channels).map((key) => escapeHtml(doorNameByKey.get(String(key)) || key)).join(', ')}</td>
               <td>${interlock.enabled === false ? 'Não' : 'Sim'}</td>
               <td>
                 <button type="button" class="icon-button interlock-edit" data-id="${escapeHtml(interlock._id)}" title="Editar">
@@ -1459,11 +1621,15 @@ function getStatusColor(status) {
   }
 
   function updateInterlockRuntimeStatus() {
-    document.querySelectorAll('.interlock-status-item[data-channel-id]').forEach((item) => {
-      const channelId = item.getAttribute('data-channel-id');
-      const state = gateStatusByChannel[channelId] || {};
+    document.querySelectorAll('.interlock-status-item[data-door-key]').forEach((item) => {
+      const channelIds = String(item.getAttribute('data-channel-ids') || '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const state = getDoorRuntimeState({ channelIds });
       const controller = item.querySelector('.controller-status-pill');
       const gate = item.querySelector('.gate-status-pill');
+      const cooldown = item.querySelector('.cooldown-status-pill');
       if (controller) {
         const meta = controllerStatusMeta(state.controllerOnline === true);
         controller.className = `controller-status-pill ${meta.className}`;
@@ -1474,6 +1640,12 @@ function getStatusColor(status) {
         gate.className = `gate-status-pill ${meta.className}`;
         gate.textContent = meta.label;
       }
+      if (cooldown) {
+        const meta = cooldownStatusMeta(state);
+        cooldown.className = `cooldown-status-pill ${meta.className}`;
+        cooldown.textContent = meta.label;
+        cooldown.title = state.cooldownExpiresAt ? `Expira em ${state.cooldownExpiresAt}` : '';
+      }
     });
   }
 
@@ -1483,12 +1655,12 @@ function getStatusColor(status) {
     document.getElementById('interlock-enabled').checked = true;
     document.getElementById('interlock-block-unknown').checked = true;
     document.getElementById('interlock-stale-ms').value = '15000';
-    document.querySelectorAll('input[name="interlock-channel"]').forEach((input) => {
+    document.querySelectorAll('input[name="interlock-door"]').forEach((input) => {
       input.checked = false;
     });
   }
 
-  function handleEditInterlock(interlockId) {
+  function handleEditInterlock(interlockId, channels = []) {
     const interlock = interlocksCache.find((item) => String(item._id) === String(interlockId));
     if (!interlock) return;
     document.getElementById('interlock-id').value = interlock._id;
@@ -1496,19 +1668,19 @@ function getStatusColor(status) {
     document.getElementById('interlock-enabled').checked = interlock.enabled !== false;
     document.getElementById('interlock-block-unknown').checked = interlock.blockUnknown !== false;
     document.getElementById('interlock-stale-ms').value = String(interlock.staleAfterMs || 15000);
-    const selected = new Set((interlock.channelIds || []).map(String));
-    document.querySelectorAll('input[name="interlock-channel"]').forEach((input) => {
+    const selected = new Set(getInterlockDoorKeys(interlock, channels).map(String));
+    document.querySelectorAll('input[name="interlock-door"]').forEach((input) => {
       input.checked = selected.has(String(input.value));
     });
   }
 
-  async function handleDeleteInterlock(interlockId, channels) {
+  async function handleDeleteInterlock(interlockId, channels, doors) {
     if (!confirm('Excluir este intertravamento?')) return;
     try {
       await fetchJson(`/api/interlocks/${encodeURIComponent(interlockId)}`, { method: 'DELETE' });
       const payload = await fetchJson('/api/interlocks');
       interlocksCache = Array.isArray(payload.interlocks) ? payload.interlocks : [];
-      renderInterlocksScreen(channels);
+      renderInterlocksScreen(channels, doors);
       feather.replace();
       showSnackMessage('Intertravamento excluído.', 'info');
     } catch (error) {
@@ -1516,13 +1688,37 @@ function getStatusColor(status) {
     }
   }
 
-  async function saveInterlockFromForm(channels) {
-    const selected = Array.from(document.querySelectorAll('input[name="interlock-channel"]:checked'))
+  async function saveInterlockSettings() {
+    const payload = {
+      gateCommandCooldownMs: Number(document.getElementById('interlock-cooldown-ms').value || 15000),
+    };
+
+    try {
+      const response = await fetchJson('/api/interlocks/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      interlockSettingsCache = normalizeInterlockSettings(response.settings || payload);
+      document.getElementById('interlock-cooldown-ms').value = String(interlockSettingsCache.gateCommandCooldownMs);
+      showSnackMessage('Configuração salva.', 'info');
+    } catch (error) {
+      showSnackMessage(error?.message || 'Erro ao salvar configuração.', 'error');
+    }
+  }
+
+  async function saveInterlockFromForm(channels, doors = buildInterlockDoors(channels)) {
+    const selected = Array.from(document.querySelectorAll('input[name="interlock-door"]:checked'))
       .map((input) => input.value);
     if (selected.length < 2) {
-      showSnackMessage('Selecione pelo menos 2 canais.', 'error');
+      showSnackMessage('Selecione pelo menos 2 portas.', 'error');
       return;
     }
+
+    const doorByKey = new Map(doors.map((door) => [String(door.key), door]));
+    const selectedChannelIds = Array.from(new Set(selected.flatMap((doorKey) => (
+      doorByKey.get(String(doorKey))?.channelIds || []
+    ))));
 
     const payload = {
       _id: document.getElementById('interlock-id').value || undefined,
@@ -1530,7 +1726,8 @@ function getStatusColor(status) {
       enabled: document.getElementById('interlock-enabled').checked,
       blockUnknown: document.getElementById('interlock-block-unknown').checked,
       staleAfterMs: Number(document.getElementById('interlock-stale-ms').value || 15000),
-      channelIds: selected,
+      doorKeys: selected,
+      channelIds: selectedChannelIds,
     };
 
     try {
@@ -1541,7 +1738,10 @@ function getStatusColor(status) {
       });
       const interlocksPayload = await fetchJson('/api/interlocks');
       interlocksCache = Array.isArray(interlocksPayload.interlocks) ? interlocksPayload.interlocks : [];
-      renderInterlocksScreen(channels);
+      const nextDoors = Array.isArray(interlocksPayload.doors) && interlocksPayload.doors.length
+        ? interlocksPayload.doors
+        : doors;
+      renderInterlocksScreen(channels, nextDoors);
       feather.replace();
       showSnackMessage('Intertravamento salvo.', 'info');
     } catch (error) {
