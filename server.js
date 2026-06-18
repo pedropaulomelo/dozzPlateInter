@@ -466,6 +466,16 @@ function getChannelMg300DoorNumber(channel = {}) {
   return toIntegerOrNull(channel.port);
 }
 
+function getEventMg300ReceptorIndex(event = {}) {
+  const receptorIndex = toIntegerOrNull(event.receptorIndex);
+  if (receptorIndex !== null) return receptorIndex;
+
+  const receptorAdd = toIntegerOrNull(event.receptorAdd ?? event.receptor);
+  if (receptorAdd !== null) return Math.max(0, receptorAdd - 1);
+
+  return null;
+}
+
 function bufferToPrintableAscii(buffer) {
   return Buffer.from(buffer)
     .toString('ascii')
@@ -651,6 +661,71 @@ function refreshMg300StatusForChannelSoon(channel, reason = 'channel_start') {
       `[mg3000-status] falha ao consultar status inicial do canal ${channel?._id || ''}:`,
       error?.code || error?.message || error
     );
+  });
+}
+
+async function refreshMg300StatusFromGatewayEvent(eventPayload = {}, reason = 'gateway_event_status_refresh') {
+  const controllerAddress = normalizeControllerAddress(eventPayload.controllerAddress);
+  const receptorIndex = getEventMg300ReceptorIndex(eventPayload);
+  if (!controllerAddress || receptorIndex === null) {
+    console.warn(`[mg3000-status] evento sem dados para consulta de status ${describeMg300Event(eventPayload)}`);
+    return null;
+  }
+
+  console.log(`[mg3000-status] consulta por evento ${describeMg300Event(eventPayload)} reason=${reason}`);
+  const status = await queryMg300SensorStatus(controllerAddress, MG300_TCP_PORT, receptorIndex);
+  const channels = await findAsync(settingsDb, {});
+  const sameControllerChannels = channels.filter((candidate) => (
+    normalizeControllerAddress(candidate.equipAdd) === controllerAddress
+    && getChannelMg300ReceptorIndex(candidate) === receptorIndex
+  ));
+
+  const runtimeKey = buildControllerRuntimeKey(eventPayload);
+  const updates = [];
+  for (const channel of sameControllerChannels) {
+    const doorNumber = getChannelMg300DoorNumber(channel);
+    const doorStatus = status?.doorsStatus?.[`door${doorNumber}`];
+    if (doorStatus !== true && doorStatus !== false) {
+      console.warn(`[mg3000-status] status sem door${doorNumber} para canal=${channel._id} raw=${status?.rawHex || '-'}`);
+      continue;
+    }
+
+    const update = setChannelGateStatus(channel._id, normalizeGateStatusFromDoorStatus(doorStatus), {
+      doorStatus,
+      controllerOnline: true,
+      controllerKey: runtimeKey,
+      controllerAddress,
+      apiKey: eventPayload.apiKey || channel.mg3000ApiKey || channel.apiKey || null,
+      receptorAdd: receptorIndex,
+      door: doorNumber,
+      lastEventKey: `${reason}:${eventPayload.eventKey || 'event'}`,
+      lastRawHex: status?.rawHex || eventPayload.rawHex || null,
+    });
+    if (update) {
+      updates.push(update);
+      console.log(`[mg3000-status] refresh por evento atualizou canal=${channel._id} nome="${channel.name || ''}" rec=${receptorIndex} door=${doorNumber} status=${describeDoorStatus(doorStatus)} gate=${update.gateStatus}`);
+    }
+  }
+
+  if (updates.length === 0) {
+    console.warn(`[mg3000-status] refresh por evento sem canais atualizados rec=${receptorIndex} raw=${status?.rawHex || '-'}`);
+  }
+
+  return { status, updates };
+}
+
+function scheduleMg300StatusRefreshFromGatewayEvent(eventPayload = {}) {
+  const delaysMs = [250, 1500, 4000];
+  delaysMs.forEach((delayMs) => {
+    setTimeout(() => {
+      refreshMg300StatusFromGatewayEvent(eventPayload, `after_${delayMs}ms`)
+        .catch((error) => {
+          console.warn(
+            `[mg3000-status] falha no refresh por evento delay=${delayMs}ms:`,
+            error?.code || error?.message || error
+          );
+        });
+    }, delayMs);
   });
 }
 
@@ -872,13 +947,17 @@ function getMg3000EventType(frame) {
   const eventType = (frame[0] & 0xF0) >> 4;
   switch (eventType) {
     case 0x00: return 'acessoRf';
-    case 0x01: return 'carona';
+    case 0x01: return getMg3000CaronaFlag(frame) ? 'carona' : 'statusTrigger';
     case 0x06: return 'baseAbriu';
     case 0x08: return 'clonagem';
     case 0x09: return 'panicoRf';
     case 0x0C: return 'receptor';
     default: return null;
   }
+}
+
+function getMg3000CaronaFlag(frame) {
+  return (frame[14] & 0x08) !== 0;
 }
 
 function getMg3000ReceiverEvent(frame) {
@@ -966,6 +1045,10 @@ async function forwardMg3000EventToApiRedis(eventPayload) {
     console.warn(`[mg3000-gateway] forward desabilitado sem MG3000_EVENT_URL event=${describeMg300Event(eventPayload)}`);
     return;
   }
+  if (eventPayload.eventKey === 'statusTrigger') {
+    console.log(`[mg3000-gateway] forward ignorado: statusTrigger local-only ${describeMg300Event(eventPayload)}`);
+    return;
+  }
 
   try {
     const headers = { 'Content-Type': 'application/json' };
@@ -1004,7 +1087,8 @@ async function applyMg3000EventToLocalState(eventPayload) {
   });
 
   if (eventPayload.doorStatus === null || eventPayload.doorStatus === undefined) {
-    console.log(`[mg3000-gateway] evento sem status de porta, nao altera canal ${describeMg300Event(eventPayload)}`);
+    console.log(`[mg3000-gateway] evento sem status de porta, agendando consulta de status ${describeMg300Event(eventPayload)}`);
+    scheduleMg300StatusRefreshFromGatewayEvent(eventPayload);
     emitGatewayStatusUpdate('mg3000-event', eventPayload);
     return [];
   }
