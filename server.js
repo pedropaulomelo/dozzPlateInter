@@ -1239,8 +1239,8 @@ function normalizePlateKey(plate) {
   return String(plate || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
-function getHandoffKey(plateKey, interlockId) {
-  return `${plateKey}:${String(interlockId || '')}`;
+function getHandoffKey(plateKey, interlockId, doorKey) {
+  return `${plateKey}:${String(interlockId || '')}:${String(doorKey || '')}`;
 }
 
 function getActiveInterlocksForDoor(interlocks = [], channels = [], doorKey) {
@@ -1276,10 +1276,9 @@ async function assertInterlockHandoffAllowed({ plate, targetDoorKey, channels })
   const memberships = await findInterlockMembershipsForDoor(targetDoorKey, channels);
 
   for (const { interlock } of memberships) {
-    const key = getHandoffKey(plateKey, interlock._id);
+    const key = getHandoffKey(plateKey, interlock._id, targetDoorKey);
     const handoff = interlockHandoffByPlate.get(key);
     if (!handoff) continue;
-    if (handoff.doorKey !== targetDoorKey) continue;
 
     const remainingMs = Math.max(0, Number(handoff.expiresAt || 0) - now);
     return {
@@ -1317,7 +1316,7 @@ async function recordInterlockHandoff({ plate, targetDoorKey, channelId }) {
   };
 
   for (const { interlock } of memberships) {
-    const key = getHandoffKey(plateKey, interlock._id);
+    const key = getHandoffKey(plateKey, interlock._id, targetDoorKey);
     interlockHandoffByPlate.set(key, {
       ...handoff,
       interlockId: interlock._id,
