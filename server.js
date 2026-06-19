@@ -327,7 +327,6 @@ const gateCooldownByChannel = new Map();
 let gateDecisionQueue = Promise.resolve();
 const INTERLOCK_SETTINGS_ID = '__interlock_settings__';
 const DEFAULT_GATE_COMMAND_COOLDOWN_MS = 15000;
-const DEFAULT_GATE_CLOSED_SETTLE_MS = 3000;
 
 // 1 sessão ativa por canal (janela de correlação)
 const speedSessions = new Map(); // channelId -> { sessionId, radarId, speed, speedTimestampMs, deadlineMs, timer, cleanupTimer }
@@ -1069,10 +1068,6 @@ function normalizeInterlockSettingsDoc(payload = {}, existing = null) {
       payload.gateCommandCooldownMs ?? existing?.gateCommandCooldownMs,
       DEFAULT_GATE_COMMAND_COOLDOWN_MS
     ),
-    gateClosedSettleMs: normalizeDurationMs(
-      payload.gateClosedSettleMs ?? existing?.gateClosedSettleMs,
-      DEFAULT_GATE_CLOSED_SETTLE_MS
-    ),
     createdAt: existing?.createdAt || now,
     updatedAt: now,
   };
@@ -1239,15 +1234,11 @@ function dispatchPlateAccessEvent({ channelId, plate, camera, event }) {
   io.emit('plate-found', event);
 }
 
-function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown, options = {}) {
+function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown) {
   const ageMs = state?.updatedAt ? Date.now() - Number(state.updatedAt) : Number.POSITIVE_INFINITY;
   const isStale = ageMs > staleAfterMs;
   const gateStatus = isStale ? 'unknown' : String(state?.gateStatus || 'unknown');
   if (gateStatus === 'open' || gateStatus === 'opening') return true;
-  const gateClosedSettleMs = Math.max(0, Number(options.gateClosedSettleMs || 0));
-  if (!isStale && gateClosedSettleMs > 0 && (state?.gateStatus === 'closed' || state?.doorStatus === true)) {
-    return ageMs < gateClosedSettleMs;
-  }
   return blockUnknown && gateStatus === 'unknown';
 }
 
@@ -1258,8 +1249,6 @@ async function evaluateChannelInterlock(channelId) {
   const channels = await findAsync(settingsDb, {});
   const targetChannel = channels.find((channel) => String(channel._id) === normalizedChannelId);
   const targetDoorKey = getChannelPhysicalDoorKey(targetChannel) || `channel:${normalizedChannelId}`;
-  const settings = await getInterlockSettings();
-  const gateClosedSettleMs = normalizeDurationMs(settings.gateClosedSettleMs, DEFAULT_GATE_CLOSED_SETTLE_MS);
   const interlocks = await findAsync(interlocksDb, { enabled: { $ne: false } });
   for (const interlock of interlocks) {
     if (interlock?._id === INTERLOCK_SETTINGS_ID || interlock?.type === 'settings') continue;
@@ -1272,7 +1261,7 @@ async function evaluateChannelInterlock(channelId) {
     for (const linkedDoorKey of doorKeys) {
       if (!linkedDoorKey || linkedDoorKey === targetDoorKey) continue;
       const linkedState = getPhysicalDoorRuntimeState(linkedDoorKey, channels);
-      if (!isGateStateBlocking(linkedState, staleAfterMs, blockUnknown, { gateClosedSettleMs })) continue;
+      if (!isGateStateBlocking(linkedState, staleAfterMs, blockUnknown)) continue;
 
       return {
         allowed: false,
@@ -1283,7 +1272,6 @@ async function evaluateChannelInterlock(channelId) {
         blockingChannelId: linkedState.channelIds?.[0] || null,
         blockingGateStatus: linkedState.gateStatus || 'unknown',
         blockingUpdatedAt: linkedState.updatedAtIso || null,
-        gateClosedSettleMs,
       };
     }
   }
@@ -3438,7 +3426,6 @@ function startPlateRecognition(channel, actions, areas, directions, res) {
       process: plateBatchWorkerProcess,
       status: 'starting',
       managedBy: 'plate_batch',
-      lastPlateDetectionTime: 0,
     };
 
     io.emit('process-starting', { channelId: channel._id });
@@ -3514,7 +3501,6 @@ function startPlateRecognition(channel, actions, areas, directions, res) {
   processes[channelId] = {
     process: process,
     status: 'starting',
-    lastPlateDetectionTime: 0
   };
 
   io.emit('process-starting', { channelId: channel._id });
@@ -3660,7 +3646,6 @@ function startSpeed(channel, res) {
   processes[channelId] = {
     process: process,
     status: 'starting',
-    lastPlateDetectionTime: 0
   };
 
   io.emit('process-starting', { channelId: channel._id });
@@ -3709,22 +3694,9 @@ function handlePlateDetection(channelId, plateData, direction, timestamp, metada
       return;
     }
 
-    // Aplicar lógica de supressão de 5s apenas se direction === true
     if (direction === true) {
-      const now = Date.now();
-      const lastTime = processes[channelId]?.lastPlateDetectionTime || 0;
-      // Verificar intervalo de supressão (5s)
-      if (now - lastTime < 5000) {
-        console.log(`Ignorando placa detectada em ${channelId} devido ao intervalo de supressão.`);
-        releaseLock();
-        return;
-      }
-
       const cooldown = getActiveChannelGateCooldown(channelId);
       if (cooldown) {
-        if (processes[channelId]) {
-          processes[channelId].lastPlateDetectionTime = Date.now();
-        }
         console.log(`[gate-cooldown] ignorando placa no canal ${channelId}; restanteMs=${Math.ceil(cooldown.remainingMs)} reason=${cooldown.reason || '-'}`);
         releaseLock();
         return;
@@ -3748,7 +3720,7 @@ function handlePlateDetection(channelId, plateData, direction, timestamp, metada
               console.log(`Placa correspondente encontrada: ${dbPlate}`);
               plateFound = true;
 
-              // Só salva evento e aplica supressão quando a abertura for aceita.
+              // Só salva evento quando a abertura for aceita.
               if (direction === true) {
                 const customerInfo = {
                   plate: dbPlate,
@@ -3779,9 +3751,6 @@ function handlePlateDetection(channelId, plateData, direction, timestamp, metada
 
                 openDoor(channelId)
                   .then(() => {
-                    if (processes[channelId]) {
-                      processes[channelId].lastPlateDetectionTime = Date.now();
-                    }
                     io.to(channelId).emit('door-command-result', {
                       channelId,
                       plate: dbPlate,
