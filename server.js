@@ -330,7 +330,7 @@ const INTERLOCK_SETTINGS_ID = '__interlock_settings__';
 const DEFAULT_GATE_COMMAND_COOLDOWN_MS = 15000;
 const DEFAULT_INTERLOCK_HANDOFF_SUPPRESSION_MS = Number.isFinite(Number(process.env.INTERLOCK_HANDOFF_SUPPRESSION_MS))
   ? Math.max(1000, Math.min(10 * 60 * 1000, Number(process.env.INTERLOCK_HANDOFF_SUPPRESSION_MS)))
-  : 60000;
+  : 30000;
 
 // 1 sessão ativa por canal (janela de correlação)
 const speedSessions = new Map(); // channelId -> { sessionId, radarId, speed, speedTimestampMs, deadlineMs, timer, cleanupTimer }
