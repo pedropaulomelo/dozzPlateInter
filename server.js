@@ -1242,6 +1242,35 @@ function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown) {
   return blockUnknown && gateStatus === 'unknown';
 }
 
+function shouldRefreshGateStateBeforeInterlock(state = {}, staleAfterMs) {
+  const ageMs = state?.updatedAt ? Date.now() - Number(state.updatedAt) : Number.POSITIVE_INFINITY;
+  const gateStatus = String(state?.gateStatus || 'unknown');
+  return gateStatus === 'unknown' || ageMs > staleAfterMs;
+}
+
+async function getFreshPhysicalDoorRuntimeState(doorKey, channels = [], staleAfterMs) {
+  let state = getPhysicalDoorRuntimeState(doorKey, channels);
+  if (!shouldRefreshGateStateBeforeInterlock(state, staleAfterMs)) {
+    return state;
+  }
+
+  const channel = channels.find((candidate) => getChannelPhysicalDoorKey(candidate) === doorKey);
+  if (!channel) return state;
+
+  try {
+    console.log(`[interlock] status ${state.gateStatus || 'unknown'} para doorKey=${doorKey}; consultando controladora antes de bloquear.`);
+    await refreshMg300StatusForChannel(channel, 'interlock_precheck');
+    state = getPhysicalDoorRuntimeState(doorKey, channels);
+  } catch (error) {
+    console.warn(
+      `[interlock] falha ao consultar status antes de decidir doorKey=${doorKey}:`,
+      error?.code || error?.message || error
+    );
+  }
+
+  return state;
+}
+
 async function evaluateChannelInterlock(channelId) {
   const normalizedChannelId = normalizeChannelId(channelId);
   if (!normalizedChannelId) return { allowed: true };
@@ -1260,7 +1289,7 @@ async function evaluateChannelInterlock(channelId) {
     const blockUnknown = interlock.blockUnknown !== false;
     for (const linkedDoorKey of doorKeys) {
       if (!linkedDoorKey || linkedDoorKey === targetDoorKey) continue;
-      const linkedState = getPhysicalDoorRuntimeState(linkedDoorKey, channels);
+      const linkedState = await getFreshPhysicalDoorRuntimeState(linkedDoorKey, channels, staleAfterMs);
       if (!isGateStateBlocking(linkedState, staleAfterMs, blockUnknown)) continue;
 
       return {
