@@ -324,9 +324,13 @@ const plateSyncWriteQueues = new Map();
 const gateStatusByChannel = new Map();
 const mg3000RuntimeByKey = new Map();
 const gateCooldownByChannel = new Map();
+const interlockHandoffByPlate = new Map();
 let gateDecisionQueue = Promise.resolve();
 const INTERLOCK_SETTINGS_ID = '__interlock_settings__';
 const DEFAULT_GATE_COMMAND_COOLDOWN_MS = 15000;
+const DEFAULT_INTERLOCK_HANDOFF_SUPPRESSION_MS = Number.isFinite(Number(process.env.INTERLOCK_HANDOFF_SUPPRESSION_MS))
+  ? Math.max(1000, Math.min(10 * 60 * 1000, Number(process.env.INTERLOCK_HANDOFF_SUPPRESSION_MS)))
+  : 60000;
 
 // 1 sessão ativa por canal (janela de correlação)
 const speedSessions = new Map(); // channelId -> { sessionId, radarId, speed, speedTimestampMs, deadlineMs, timer, cleanupTimer }
@@ -1194,7 +1198,7 @@ async function startPhysicalDoorCooldownForChannel(channelId, cooldownMs, reason
 }
 
 function isIgnoredOpenError(error) {
-  return ['interlock_blocked', 'gate_cooldown'].includes(String(error?.code || ''));
+  return ['interlock_blocked', 'gate_cooldown', 'interlock_handoff'].includes(String(error?.code || ''));
 }
 
 function dispatchPlateAccessEvent({ channelId, plate, camera, event }) {
@@ -1229,6 +1233,106 @@ function shouldRefreshGateStateBeforeInterlock(state = {}, staleAfterMs) {
   const isCommandCooldownState = Boolean(state?.cooldown)
     && (gateStatus === 'open' || gateStatus === 'opening');
   return gateStatus === 'unknown' || ageMs > staleAfterMs || isCommandCooldownState;
+}
+
+function normalizePlateKey(plate) {
+  return String(plate || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function getHandoffKey(plateKey, interlockId) {
+  return `${plateKey}:${String(interlockId || '')}`;
+}
+
+function getActiveInterlocksForDoor(interlocks = [], channels = [], doorKey) {
+  return interlocks
+    .filter((interlock) => interlock?._id !== INTERLOCK_SETTINGS_ID && interlock?.type !== 'settings')
+    .map((interlock) => ({
+      interlock,
+      doorKeys: getInterlockDoorKeys(interlock, channels),
+    }))
+    .filter((item) => item.doorKeys.includes(doorKey) && item.doorKeys.length > 1);
+}
+
+async function findInterlockMembershipsForDoor(doorKey, channels = null) {
+  const safeChannels = Array.isArray(channels) ? channels : await findAsync(settingsDb, {});
+  const interlocks = await findAsync(interlocksDb, { enabled: { $ne: false } });
+  return getActiveInterlocksForDoor(interlocks, safeChannels, doorKey);
+}
+
+function clearExpiredInterlockHandoffs(now = Date.now()) {
+  for (const [key, handoff] of interlockHandoffByPlate.entries()) {
+    if (Number(handoff.expiresAt || 0) <= now) {
+      interlockHandoffByPlate.delete(key);
+    }
+  }
+}
+
+async function assertInterlockHandoffAllowed({ plate, targetDoorKey, channels }) {
+  const plateKey = normalizePlateKey(plate);
+  if (!plateKey || !targetDoorKey) return { allowed: true };
+
+  const now = Date.now();
+  clearExpiredInterlockHandoffs(now);
+  const memberships = await findInterlockMembershipsForDoor(targetDoorKey, channels);
+
+  for (const { interlock } of memberships) {
+    const key = getHandoffKey(plateKey, interlock._id);
+    const handoff = interlockHandoffByPlate.get(key);
+    if (!handoff) continue;
+    if (handoff.doorKey !== targetDoorKey) continue;
+
+    const remainingMs = Math.max(0, Number(handoff.expiresAt || 0) - now);
+    return {
+      allowed: false,
+      code: 'interlock_handoff',
+      plateKey,
+      interlockId: interlock._id,
+      interlockName: interlock.name,
+      doorKey: targetDoorKey,
+      remainingMs,
+      expiresAt: handoff.expiresAtIso || null,
+    };
+  }
+
+  return { allowed: true };
+}
+
+async function recordInterlockHandoff({ plate, targetDoorKey, channelId }) {
+  const plateKey = normalizePlateKey(plate);
+  if (!plateKey || !targetDoorKey) return;
+
+  const memberships = await findInterlockMembershipsForDoor(targetDoorKey);
+  if (!memberships.length) return;
+
+  const now = Date.now();
+  const expiresAt = now + DEFAULT_INTERLOCK_HANDOFF_SUPPRESSION_MS;
+  const handoff = {
+    plateKey,
+    doorKey: targetDoorKey,
+    channelId: normalizeChannelId(channelId),
+    startedAt: now,
+    startedAtIso: new Date(now).toISOString(),
+    expiresAt,
+    expiresAtIso: new Date(expiresAt).toISOString(),
+  };
+
+  for (const { interlock } of memberships) {
+    const key = getHandoffKey(plateKey, interlock._id);
+    interlockHandoffByPlate.set(key, {
+      ...handoff,
+      interlockId: interlock._id,
+      interlockName: interlock.name,
+    });
+    console.log(`[interlock-handoff] plate=${plateKey} interlock=${interlock._id} doorKey=${targetDoorKey} ttlMs=${DEFAULT_INTERLOCK_HANDOFF_SUPPRESSION_MS}`);
+  }
+}
+
+async function recordInterlockHandoffAfterCommand(context) {
+  try {
+    await recordInterlockHandoff(context);
+  } catch (error) {
+    console.warn('[interlock-handoff] falha ao registrar handoff apos comando:', error?.message || error);
+  }
 }
 
 async function getFreshPhysicalDoorRuntimeState(doorKey, channels = [], staleAfterMs) {
@@ -3761,7 +3865,7 @@ function handlePlateDetection(channelId, plateData, direction, timestamp, metada
                   sourceEventType: metadata.eventType || null,
                 };
 
-                openDoor(channelId)
+                openDoor(channelId, { plate: dbPlate })
                   .then(() => {
                     io.to(channelId).emit('door-command-result', {
                       channelId,
@@ -4171,6 +4275,7 @@ async function openDoor(channelId, options = {}) {
     try {
       console.log('Opening Door');
 
+      const normalizedChannelId = normalizeChannelId(channelId);
       const cooldown = options.ignoreCooldown === true ? null : getActiveChannelGateCooldown(channelId);
       if (cooldown) {
         const remainingMs = Math.ceil(cooldown.remainingMs);
@@ -4186,6 +4291,33 @@ async function openDoor(channelId, options = {}) {
         throw error;
       }
 
+      const canal = await findOneAsync(settingsDb, { _id: channelId });
+      if (!canal) {
+        throw new Error(`Canal com ID ${channelId} não encontrado no settingsDb.`);
+      }
+
+      const targetDoorKey = getChannelPhysicalDoorKey(canal) || `channel:${normalizedChannelId}`;
+      if (options.ignoreInterlock !== true) {
+        const handoff = await assertInterlockHandoffAllowed({
+          plate: options.plate,
+          targetDoorKey,
+        });
+        if (!handoff.allowed) {
+          const remainingMs = Math.ceil(handoff.remainingMs || 0);
+          const error = new Error(`Porta em handoff do intertravamento por mais ${Math.ceil(remainingMs / 1000)}s.`);
+          error.code = 'interlock_handoff';
+          error.cooldown = {
+            channelId: normalizedChannelId,
+            remainingMs,
+            expiresAt: handoff.expiresAt || null,
+            reason: 'interlock_handoff',
+          };
+          error.interlock = handoff;
+          console.warn('[interlock-handoff] abertura bloqueada:', handoff);
+          throw error;
+        }
+      }
+
       const interlock = options.ignoreInterlock === true
         ? { allowed: true, ignored: true }
         : await evaluateChannelInterlock(channelId);
@@ -4195,11 +4327,6 @@ async function openDoor(channelId, options = {}) {
         error.interlock = interlock;
         console.warn('[interlock] abertura bloqueada:', interlock);
         throw error;
-      }
-
-      const canal = await findOneAsync(settingsDb, { _id: channelId });
-      if (!canal) {
-        throw new Error(`Canal com ID ${channelId} não encontrado no settingsDb.`);
       }
 
       setChannelGateStatus(channelId, 'opening', {
@@ -4216,6 +4343,7 @@ async function openDoor(channelId, options = {}) {
       if (doorDriver === 'dozz_vehicle') {
         await openDoorViaDozzVehicle(canal, channelId);
         await startConfiguredGateCooldown(channelId, 'command_open:dozz_vehicle');
+        await recordInterlockHandoffAfterCommand({ plate: options.plate, targetDoorKey, channelId });
         console.log(`Comando HTTP enviado para Dozz Vehicle no canal ${channelId}.`);
         return;
       }
@@ -4243,6 +4371,7 @@ async function openDoor(channelId, options = {}) {
       });
 
       await startConfiguredGateCooldown(channelId, 'command_open:mg3000');
+      await recordInterlockHandoffAfterCommand({ plate: options.plate, targetDoorKey, channelId });
       console.log(`Comando enviado para abrir a porta no canal ${channelId}.`);
     } catch (error) {
       console.error(`Erro ao enviar comando de abertura no canal ${channelId}:`, error);
