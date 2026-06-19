@@ -836,9 +836,6 @@ function setChannelGateStatus(channelId, status, patch = {}) {
   };
 
   gateStatusByChannel.set(normalizedChannelId, next);
-  if (next.gateStatus === 'closed' || next.doorStatus === true) {
-    clearChannelGateCooldown(normalizedChannelId, 'gate_closed', { emit: false });
-  }
   emitGatewayStatusUpdate('gate-status-updated', {
     ...next,
     ...getChannelGateCooldownPayload(normalizedChannelId),
@@ -996,26 +993,17 @@ function getPhysicalDoorRuntimeState(doorKey, channels = []) {
   const activeCooldown = members
     .map((channel) => getActiveChannelGateCooldown(channel._id))
     .find(Boolean);
-  if (activeCooldown) {
-    return {
-      gateStatus: 'opening',
-      doorStatus: false,
-      updatedAt: Date.now(),
-      channelIds: members.map((channel) => channel._id),
-      cooldown: activeCooldown,
-    };
-  }
 
   const openState = states.find((state) => state.gateStatus === 'open' || state.gateStatus === 'opening');
-  if (openState) return { ...openState, channelIds: members.map((channel) => channel._id) };
+  if (openState) return { ...openState, channelIds: members.map((channel) => channel._id), cooldown: activeCooldown || null };
 
   const unknownState = states.find((state) => !state.gateStatus || state.gateStatus === 'unknown');
-  if (unknownState) return { ...unknownState, channelIds: members.map((channel) => channel._id) };
+  if (unknownState) return { ...unknownState, channelIds: members.map((channel) => channel._id), cooldown: activeCooldown || null };
 
   const newestState = states.reduce((best, state) => (
     Number(state.updatedAt || 0) > Number(best.updatedAt || 0) ? state : best
   ), states[0] || {});
-  return { ...newestState, channelIds: members.map((channel) => channel._id) };
+  return { ...newestState, channelIds: members.map((channel) => channel._id), cooldown: activeCooldown || null };
 }
 
 async function findChannelsForMg3000Event(event = {}) {
@@ -1148,13 +1136,6 @@ function getActiveChannelGateCooldown(channelId) {
   const cooldown = gateCooldownByChannel.get(normalizedChannelId);
   if (!cooldown) return null;
 
-  const state = getChannelGateRuntime(normalizedChannelId);
-  const statusUpdatedAt = Number(state?.updatedAt || 0);
-  if ((state?.gateStatus === 'closed' || state?.doorStatus === true) && statusUpdatedAt >= Number(cooldown.startedAt || 0)) {
-    clearChannelGateCooldown(normalizedChannelId, 'gate_closed');
-    return null;
-  }
-
   const remainingMs = Number(cooldown.expiresAt || 0) - Date.now();
   if (remainingMs <= 0) {
     clearChannelGateCooldown(normalizedChannelId, 'expired');
@@ -1245,7 +1226,9 @@ function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown) {
 function shouldRefreshGateStateBeforeInterlock(state = {}, staleAfterMs) {
   const ageMs = state?.updatedAt ? Date.now() - Number(state.updatedAt) : Number.POSITIVE_INFINITY;
   const gateStatus = String(state?.gateStatus || 'unknown');
-  return gateStatus === 'unknown' || ageMs > staleAfterMs;
+  const isCommandCooldownState = Boolean(state?.cooldown)
+    && (gateStatus === 'open' || gateStatus === 'opening');
+  return gateStatus === 'unknown' || ageMs > staleAfterMs || isCommandCooldownState;
 }
 
 async function getFreshPhysicalDoorRuntimeState(doorKey, channels = [], staleAfterMs) {
