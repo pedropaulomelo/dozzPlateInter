@@ -137,6 +137,42 @@ def parse_bool(value, default=True):
     return bool(default)
 
 
+def clamp_int(value, default, min_value=None, max_value=None):
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        out = int(default)
+    if min_value is not None:
+        out = max(min_value, out)
+    if max_value is not None:
+        out = min(max_value, out)
+    return out
+
+
+def normalize_rtsp_transport(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in ("tcp", "udp", "udp_multicast", "http", "https"):
+        return normalized
+    return "tcp"
+
+
+def configure_opencv_rtsp_transport(transport=None):
+    safe_transport = normalize_rtsp_transport(transport or os.getenv("PLATE_RTSP_TRANSPORT", "tcp"))
+    existing = str(os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS") or "").strip()
+    if "rtsp_transport" in existing:
+        return existing
+
+    options = f"rtsp_transport;{safe_transport}"
+    if existing:
+        options = f"{existing}|{options}"
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
+    return options
+
+
+DEFAULT_RTSP_TRANSPORT = normalize_rtsp_transport(os.getenv("PLATE_RTSP_TRANSPORT", "tcp"))
+configure_opencv_rtsp_transport(DEFAULT_RTSP_TRANSPORT)
+
+
 def expected_orientation_for_mode(mode):
     normalized = str(mode or MOTION_DEFAULT_MODE).strip().lower()
     return "back" if normalized == "afastando" else "front"
@@ -1530,6 +1566,8 @@ def main():
     parser.add_argument('--plate_guard_fraud_classes', required=False, default=None)
     parser.add_argument('--stream_preview_side', required=False, type=int, default=None)
     parser.add_argument('--stream_jpeg_quality', required=False, type=int, default=None)
+    parser.add_argument('--stream_subtype', required=False, type=int, default=clamp_int(os.getenv("PLATE_RTSP_SUBTYPE", "0"), 0, 0, 1))
+    parser.add_argument('--rtsp_transport', required=False, default=DEFAULT_RTSP_TRANSPORT)
     args = parser.parse_args()
 
     global PLATE_GUARD_ENABLED
@@ -1624,9 +1662,19 @@ def main():
     motion_sensitivity = clamp_motion_sensitivity(args.motion_sensitivity)
     vector_sense_enabled = parse_bool(args.vector_sense_enabled, True)
 
-    video_path = f'rtsp://{args.user}:{args.password}@{args.ip}:554/cam/realmonitor?channel={args.dvr_channel}&subtype=0'
+    stream_subtype = clamp_int(args.stream_subtype, 0, 0, 1)
+    rtsp_transport = normalize_rtsp_transport(args.rtsp_transport)
+    configure_opencv_rtsp_transport(rtsp_transport)
+    video_path = f'rtsp://{args.user}:{args.password}@{args.ip}:554/cam/realmonitor?channel={args.dvr_channel}&subtype={stream_subtype}'
     # video_path = './videos/e1.avi'
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(video_path)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
     sio = socketio.Client()
 
@@ -1697,7 +1745,8 @@ def main():
     print(
         f"[plateReader] stream_fps_camera={fps:.2f} target_fps={target_fps} "
         f"skip_frames={skip_frames} preview_side={stream_preview_side} "
-        f"preview_jpeg_q={stream_jpeg_quality} infer_imgsz={img_size}"
+        f"preview_jpeg_q={stream_jpeg_quality} infer_imgsz={img_size} "
+        f"rtsp_transport={rtsp_transport} subtype={stream_subtype}"
     )
     print(f"[plateReader] socket_preview_enabled={SOCKET_PREVIEW_ENABLED}")
     print(

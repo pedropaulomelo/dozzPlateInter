@@ -78,6 +78,14 @@ const MPEGTS_IDLE_STOP_MS = Number.isFinite(Number(process.env.MPEGTS_IDLE_STOP_
 const MPEGTS_STDIN_MAX_BUFFER_BYTES = Number.isFinite(Number(process.env.MPEGTS_STDIN_MAX_BUFFER_BYTES))
   ? Math.max(32768, Number(process.env.MPEGTS_STDIN_MAX_BUFFER_BYTES))
   : 1024 * 1024;
+const PLATE_RTSP_TRANSPORT = ['tcp', 'udp', 'udp_multicast', 'http', 'https'].includes(
+  String(process.env.PLATE_RTSP_TRANSPORT || '').trim().toLowerCase()
+)
+  ? String(process.env.PLATE_RTSP_TRANSPORT || '').trim().toLowerCase()
+  : 'tcp';
+const PLATE_RTSP_SUBTYPE = Number.isFinite(Number(process.env.PLATE_RTSP_SUBTYPE))
+  ? Math.max(0, Math.min(1, Number.parseInt(process.env.PLATE_RTSP_SUBTYPE, 10)))
+  : 0;
 const MPEGTS_WS_PREFIX = '/ws/mpegts/';
 const PLATE_DEBUG_ENABLED = (process.env.PLATE_DEBUG || 'false').trim().toLowerCase() === 'true';
 const FRAME_DEBUG_INTERVAL_MS = Number.isFinite(Number(process.env.FRAME_DEBUG_INTERVAL_MS))
@@ -320,6 +328,8 @@ const pendingGateOpenByDoorKey = new Map();
 let gateDecisionQueue = Promise.resolve();
 const INTERLOCK_SETTINGS_ID = '__interlock_settings__';
 const DEFAULT_GATE_COMMAND_COOLDOWN_MS = 15000;
+const DEFAULT_PENDING_GATE_OPEN_TIMEOUT_MS = 30000;
+const DEFAULT_GATE_CLOSED_SETTLE_MS = 3000;
 
 // 1 sessão ativa por canal (janela de correlação)
 const speedSessions = new Map(); // channelId -> { sessionId, radarId, speed, speedTimestampMs, deadlineMs, timer, cleanupTimer }
@@ -832,6 +842,14 @@ function setChannelGateStatus(channelId, status, patch = {}) {
   if (next.gateStatus === 'closed' || next.doorStatus === true) {
     clearChannelGateCooldown(normalizedChannelId, 'gate_closed', { emit: false });
     schedulePendingGateOpenSweep('gate_closed');
+    getInterlockSettings()
+      .then((settings) => {
+        const settleMs = normalizeDurationMs(settings.gateClosedSettleMs, DEFAULT_GATE_CLOSED_SETTLE_MS);
+        schedulePendingGateOpenSweep('gate_closed_settled', settleMs + 75);
+      })
+      .catch(() => {
+        schedulePendingGateOpenSweep('gate_closed_settled', DEFAULT_GATE_CLOSED_SETTLE_MS + 75);
+      });
   }
   emitGatewayStatusUpdate('gate-status-updated', {
     ...next,
@@ -1062,6 +1080,14 @@ function normalizeInterlockSettingsDoc(payload = {}, existing = null) {
       payload.gateCommandCooldownMs ?? existing?.gateCommandCooldownMs,
       DEFAULT_GATE_COMMAND_COOLDOWN_MS
     ),
+    pendingGateOpenTimeoutMs: normalizeDurationMs(
+      payload.pendingGateOpenTimeoutMs ?? existing?.pendingGateOpenTimeoutMs,
+      DEFAULT_PENDING_GATE_OPEN_TIMEOUT_MS
+    ),
+    gateClosedSettleMs: normalizeDurationMs(
+      payload.gateClosedSettleMs ?? existing?.gateClosedSettleMs,
+      DEFAULT_GATE_CLOSED_SETTLE_MS
+    ),
     createdAt: existing?.createdAt || now,
     updatedAt: now,
   };
@@ -1218,12 +1244,31 @@ function clearPendingGateOpen(doorKey, reason = 'cleared') {
   return pending;
 }
 
-function schedulePendingGateOpenSweep(reason = 'status_change') {
+function expirePendingGateOpen(doorKey, reason = 'expired') {
+  const pending = clearPendingGateOpen(doorKey, reason);
+  if (!pending) return false;
+
+  console.log(`[gate-pending] expirado doorKey=${doorKey} channel=${pending.channelId} plate=${pending.plate} reason=${reason}`);
+  io.to(pending.channelId).emit('door-command-result', {
+    channelId: pending.channelId,
+    plate: pending.plate,
+    accepted: false,
+    queued: true,
+    expired: true,
+    direction: true,
+    message: 'pending_expired',
+    reason,
+    timestamp: Date.now(),
+  });
+  return true;
+}
+
+function schedulePendingGateOpenSweep(reason = 'status_change', delayMs = 50) {
   setTimeout(() => {
     processPendingGateOpens(reason).catch((error) => {
       console.warn('[gate-pending] falha ao processar pendentes:', error?.message || error);
     });
-  }, 50);
+  }, Math.max(0, Number(delayMs) || 0));
 }
 
 async function queuePendingGateOpen({ channelId, plate, camera, event, reason, error }) {
@@ -1233,12 +1278,13 @@ async function queuePendingGateOpen({ channelId, plate, camera, event, reason, e
     : await findOneAsync(settingsDb, { _id: normalizedChannelId }).catch(() => null);
   const doorKey = getChannelPhysicalDoorKey(channel) || `channel:${normalizedChannelId}`;
   const settings = await getInterlockSettings();
-  const timeoutMs = normalizeDurationMs(settings.gateCommandCooldownMs, DEFAULT_GATE_COMMAND_COOLDOWN_MS);
+  const cooldownMs = normalizeDurationMs(settings.gateCommandCooldownMs, DEFAULT_GATE_COMMAND_COOLDOWN_MS);
+  const timeoutMs = normalizeDurationMs(settings.pendingGateOpenTimeoutMs, DEFAULT_PENDING_GATE_OPEN_TIMEOUT_MS);
   const now = Date.now();
   const expiresAt = now + timeoutMs;
 
   clearPendingGateOpen(doorKey, 'replaced');
-  await startPhysicalDoorCooldownForChannel(normalizedChannelId, timeoutMs, `pending_open:${reason || error?.code || 'blocked'}`);
+  await startPhysicalDoorCooldownForChannel(normalizedChannelId, cooldownMs, `pending_open:${reason || error?.code || 'blocked'}`);
 
   const pending = {
     doorKey,
@@ -1252,17 +1298,17 @@ async function queuePendingGateOpen({ channelId, plate, camera, event, reason, e
     queuedAtIso: new Date(now).toISOString(),
     expiresAt,
     expiresAtIso: new Date(expiresAt).toISOString(),
+    cooldownMs,
+    timeoutMs,
     running: false,
     timer: setTimeout(() => {
-      processPendingGateOpen(doorKey, 'timeout', { force: true }).catch((runError) => {
-        console.warn(`[gate-pending] falha no timeout doorKey=${doorKey}:`, runError?.message || runError);
-      });
+      expirePendingGateOpen(doorKey, 'timeout');
     }, timeoutMs),
   };
   if (pending.timer?.unref) pending.timer.unref();
   pendingGateOpenByDoorKey.set(doorKey, pending);
 
-  console.log(`[gate-pending] guardado doorKey=${doorKey} channel=${normalizedChannelId} plate=${plate} reason=${pending.reason} timeoutMs=${timeoutMs}`);
+  console.log(`[gate-pending] guardado doorKey=${doorKey} channel=${normalizedChannelId} plate=${plate} reason=${pending.reason} cooldownMs=${cooldownMs} timeoutMs=${timeoutMs}`);
   io.to(normalizedChannelId).emit('door-command-result', {
     channelId: normalizedChannelId,
     plate,
@@ -1304,6 +1350,10 @@ async function processPendingGateOpen(doorKey, trigger = 'status_change', option
   const normalizedDoorKey = String(doorKey || '').trim();
   const pending = pendingGateOpenByDoorKey.get(normalizedDoorKey);
   if (!pending || pending.running) return false;
+  if (Number(pending.expiresAt || 0) <= Date.now()) {
+    expirePendingGateOpen(normalizedDoorKey, 'expired_before_process');
+    return false;
+  }
 
   pending.running = true;
   try {
@@ -1360,11 +1410,15 @@ async function processPendingGateOpens(trigger = 'status_change') {
   }
 }
 
-function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown) {
+function isGateStateBlocking(state = {}, staleAfterMs, blockUnknown, options = {}) {
   const ageMs = state?.updatedAt ? Date.now() - Number(state.updatedAt) : Number.POSITIVE_INFINITY;
   const isStale = ageMs > staleAfterMs;
   const gateStatus = isStale ? 'unknown' : String(state?.gateStatus || 'unknown');
   if (gateStatus === 'open' || gateStatus === 'opening') return true;
+  const gateClosedSettleMs = Math.max(0, Number(options.gateClosedSettleMs || 0));
+  if (!isStale && gateClosedSettleMs > 0 && (state?.gateStatus === 'closed' || state?.doorStatus === true)) {
+    return ageMs < gateClosedSettleMs;
+  }
   return blockUnknown && gateStatus === 'unknown';
 }
 
@@ -1375,6 +1429,8 @@ async function evaluateChannelInterlock(channelId) {
   const channels = await findAsync(settingsDb, {});
   const targetChannel = channels.find((channel) => String(channel._id) === normalizedChannelId);
   const targetDoorKey = getChannelPhysicalDoorKey(targetChannel) || `channel:${normalizedChannelId}`;
+  const settings = await getInterlockSettings();
+  const gateClosedSettleMs = normalizeDurationMs(settings.gateClosedSettleMs, DEFAULT_GATE_CLOSED_SETTLE_MS);
   const interlocks = await findAsync(interlocksDb, { enabled: { $ne: false } });
   for (const interlock of interlocks) {
     if (interlock?._id === INTERLOCK_SETTINGS_ID || interlock?.type === 'settings') continue;
@@ -1387,7 +1443,7 @@ async function evaluateChannelInterlock(channelId) {
     for (const linkedDoorKey of doorKeys) {
       if (!linkedDoorKey || linkedDoorKey === targetDoorKey) continue;
       const linkedState = getPhysicalDoorRuntimeState(linkedDoorKey, channels);
-      if (!isGateStateBlocking(linkedState, staleAfterMs, blockUnknown)) continue;
+      if (!isGateStateBlocking(linkedState, staleAfterMs, blockUnknown, { gateClosedSettleMs })) continue;
 
       return {
         allowed: false,
@@ -1398,6 +1454,7 @@ async function evaluateChannelInterlock(channelId) {
         blockingChannelId: linkedState.channelIds?.[0] || null,
         blockingGateStatus: linkedState.gateStatus || 'unknown',
         blockingUpdatedAt: linkedState.updatedAtIso || null,
+        gateClosedSettleMs,
       };
     }
   }
@@ -3312,6 +3369,14 @@ function buildPlateBatchChannelConfig(channel, actions, areas, directions) {
   const previewWebJpegQuality = Number.isFinite(Number(channel.previewWebJpegQuality))
     ? Math.max(10, Math.min(100, Number(channel.previewWebJpegQuality)))
     : 15;
+  const streamSubtype = Number.isFinite(Number(channel.streamSubtype))
+    ? Math.max(0, Math.min(1, Number.parseInt(channel.streamSubtype, 10)))
+    : PLATE_RTSP_SUBTYPE;
+  const rtspTransport = ['tcp', 'udp', 'udp_multicast', 'http', 'https'].includes(
+    String(channel.rtspTransport || '').trim().toLowerCase()
+  )
+    ? String(channel.rtspTransport).trim().toLowerCase()
+    : PLATE_RTSP_TRANSPORT;
 
   const safeActions = Array.isArray(actions) ? actions : [];
   const safeAreas = Array.isArray(areas) ? areas : [];
@@ -3327,6 +3392,8 @@ function buildPlateBatchChannelConfig(channel, actions, areas, directions) {
     user,
     password,
     dvrChannel: channel.dvrChannel,
+    streamSubtype,
+    rtspTransport,
     frameRate,
     imgSize,
     device,
@@ -3510,6 +3577,8 @@ function startPlateRecognition(channel, actions, areas, directions, res) {
     user,
     password,
     dvrChannel,
+    streamSubtype,
+    rtspTransport,
     frameRate,
     imgSize,
     device,
@@ -3560,6 +3629,8 @@ function startPlateRecognition(channel, actions, areas, directions, res) {
     '--device', device,
     '--channel_id', channelId,
     '--dvr_channel', String(dvrChannel),
+    '--stream_subtype', String(streamSubtype),
+    '--rtsp_transport', rtspTransport,
     '--imgsz', imgSize.toString(),
     '--stream_preview_side', previewWebSide.toString(),
     '--stream_jpeg_quality', previewWebJpegQuality.toString(),
@@ -3592,6 +3663,8 @@ function startPlateRecognition(channel, actions, areas, directions, res) {
     '--device', device,
     '--channel_id', channelId,
     '--dvr_channel', String(dvrChannel),
+    '--stream_subtype', String(streamSubtype),
+    '--rtsp_transport', rtspTransport,
     '--imgsz', imgSize.toString(),
     '--stream_preview_side', previewWebSide.toString(),
     '--stream_jpeg_quality', previewWebJpegQuality.toString(),

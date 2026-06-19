@@ -118,6 +118,34 @@ def clamp_float(value, default, min_value=None, max_value=None):
     return out
 
 
+def normalize_rtsp_transport(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in ("tcp", "udp", "udp_multicast", "http", "https"):
+        return normalized
+    return "tcp"
+
+
+def default_stream_subtype():
+    return clamp_int(os.getenv("PLATE_RTSP_SUBTYPE", "0"), 0, 0, 1)
+
+
+def configure_opencv_rtsp_transport(transport=None):
+    safe_transport = normalize_rtsp_transport(transport or os.getenv("PLATE_RTSP_TRANSPORT", "tcp"))
+    existing = str(os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS") or "").strip()
+    if "rtsp_transport" in existing:
+        return existing
+
+    options = f"rtsp_transport;{safe_transport}"
+    if existing:
+        options = f"{existing}|{options}"
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
+    return options
+
+
+DEFAULT_RTSP_TRANSPORT = normalize_rtsp_transport(os.getenv("PLATE_RTSP_TRANSPORT", "tcp"))
+configure_opencv_rtsp_transport(DEFAULT_RTSP_TRANSPORT)
+
+
 def normalize_motion_mode(raw_mode):
     mode = str(raw_mode or MOTION_DEFAULT_MODE).strip().lower()
     return "afastando" if mode == "afastando" else "aproximando"
@@ -1204,9 +1232,10 @@ def measure_performance_payload(stream_fps, img_size):
 
 
 class FrameGrabber(threading.Thread):
-    def __init__(self, rtsp_url):
+    def __init__(self, rtsp_url, rtsp_transport=DEFAULT_RTSP_TRANSPORT):
         super().__init__(daemon=True)
         self.rtsp_url = rtsp_url
+        self.rtsp_transport = normalize_rtsp_transport(rtsp_transport)
         self._lock = threading.Lock()
         self._frame = None
         self._seq = 0
@@ -1225,7 +1254,11 @@ class FrameGrabber(threading.Thread):
         cap = None
         while not self._stop_event.is_set():
             if cap is None:
-                cap = cv2.VideoCapture(self.rtsp_url)
+                configure_opencv_rtsp_transport(self.rtsp_transport)
+                cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                if not cap.isOpened():
+                    cap.release()
+                    cap = cv2.VideoCapture(self.rtsp_url)
                 try:
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception:
@@ -1259,6 +1292,8 @@ class ChannelState:
     user: str
     password: str
     dvr_channel: int
+    stream_subtype: int
+    rtsp_transport: str
     frame_rate: int
     img_size: int
     device: str
@@ -1316,7 +1351,7 @@ class ChannelState:
     def rtsp_url(self):
         return (
             f"rtsp://{self.user}:{self.password}@{self.ip}:554/"
-            f"cam/realmonitor?channel={self.dvr_channel}&subtype=0"
+            f"cam/realmonitor?channel={self.dvr_channel}&subtype={self.stream_subtype}"
         )
 
     def min_interval(self):
@@ -1515,6 +1550,8 @@ class PlateBatchWorker:
             user=str(cfg.get('user') or '').strip(),
             password=str(cfg.get('password') or '').strip(),
             dvr_channel=clamp_int(cfg.get('dvrChannel'), 1, 1, 32),
+            stream_subtype=clamp_int(cfg.get('streamSubtype'), default_stream_subtype(), 0, 1),
+            rtsp_transport=normalize_rtsp_transport(cfg.get('rtspTransport') or DEFAULT_RTSP_TRANSPORT),
             frame_rate=clamp_int(cfg.get('frameRate'), 5, 1, 60),
             img_size=img_size,
             device=device,
@@ -1560,7 +1597,7 @@ class PlateBatchWorker:
                     pass
 
             self._get_bundle(state)
-            state.capture = FrameGrabber(state.rtsp_url())
+            state.capture = FrameGrabber(state.rtsp_url(), state.rtsp_transport)
             state.capture.start()
             self.channels[state.channel_id] = state
 
@@ -1572,6 +1609,7 @@ class PlateBatchWorker:
 
         self._log(
             f"canal adicionado id={state.channel_id} ip={state.ip} dvr={state.dvr_channel} "
+            f"subtype={state.stream_subtype} rtsp_transport={state.rtsp_transport} "
             f"fps={state.frame_rate} imgsz={state.img_size} device={state.device}"
         )
 

@@ -10,7 +10,7 @@ let cadastrosData = [];
 let cadastrosVehiclesData = [];
 let gateStatusByChannel = {};
 let interlocksCache = [];
-let interlockSettingsCache = { gateCommandCooldownMs: 15000 };
+let interlockSettingsCache = { gateCommandCooldownMs: 15000, pendingGateOpenTimeoutMs: 30000, gateClosedSettleMs: 3000 };
 // (Opcional) Um mapeamento de grupo -> set de unidades
 let grupoUnidadeMapCadastros = {};
 const CADASTROS_DEBUG_ENABLED = (() => {
@@ -523,11 +523,19 @@ const categoryLabels = {
   }
 
   function normalizeInterlockSettings(settings = {}) {
-    const parsed = Number(settings.gateCommandCooldownMs);
+    const cooldownMs = Number(settings.gateCommandCooldownMs);
+    const pendingTimeoutMs = Number(settings.pendingGateOpenTimeoutMs);
+    const closedSettleMs = Number(settings.gateClosedSettleMs);
     return {
-      gateCommandCooldownMs: Number.isFinite(parsed)
-        ? Math.max(1000, Math.round(parsed))
+      gateCommandCooldownMs: Number.isFinite(cooldownMs)
+        ? Math.max(1000, Math.round(cooldownMs))
         : 15000,
+      pendingGateOpenTimeoutMs: Number.isFinite(pendingTimeoutMs)
+        ? Math.max(1000, Math.round(pendingTimeoutMs))
+        : 30000,
+      gateClosedSettleMs: Number.isFinite(closedSettleMs)
+        ? Math.max(1000, Math.round(closedSettleMs))
+        : 3000,
     };
   }
 
@@ -1476,6 +1484,14 @@ function getStatusColor(status) {
               Cooldown após abertura (ms)
               <input type="number" id="interlock-cooldown-ms" value="${escapeHtml(String(interlockSettingsCache.gateCommandCooldownMs || 15000))}" min="1000" max="600000" step="1000">
             </label>
+            <label>
+              Timeout abertura pendente (ms)
+              <input type="number" id="interlock-pending-timeout-ms" value="${escapeHtml(String(interlockSettingsCache.pendingGateOpenTimeoutMs || 30000))}" min="1000" max="600000" step="1000">
+            </label>
+            <label>
+              Estabilização após fechar (ms)
+              <input type="number" id="interlock-closed-settle-ms" value="${escapeHtml(String(interlockSettingsCache.gateClosedSettleMs || 3000))}" min="1000" max="600000" step="1000">
+            </label>
             <div class="interlock-actions-row">
               <button type="submit" class="primary-button">Salvar configuração</button>
             </div>
@@ -1691,6 +1707,8 @@ function getStatusColor(status) {
   async function saveInterlockSettings() {
     const payload = {
       gateCommandCooldownMs: Number(document.getElementById('interlock-cooldown-ms').value || 15000),
+      pendingGateOpenTimeoutMs: Number(document.getElementById('interlock-pending-timeout-ms').value || 30000),
+      gateClosedSettleMs: Number(document.getElementById('interlock-closed-settle-ms').value || 3000),
     };
 
     try {
@@ -1701,6 +1719,8 @@ function getStatusColor(status) {
       });
       interlockSettingsCache = normalizeInterlockSettings(response.settings || payload);
       document.getElementById('interlock-cooldown-ms').value = String(interlockSettingsCache.gateCommandCooldownMs);
+      document.getElementById('interlock-pending-timeout-ms').value = String(interlockSettingsCache.pendingGateOpenTimeoutMs);
+      document.getElementById('interlock-closed-settle-ms').value = String(interlockSettingsCache.gateClosedSettleMs);
       showSnackMessage('Configuração salva.', 'info');
     } catch (error) {
       showSnackMessage(error?.message || 'Erro ao salvar configuração.', 'error');
